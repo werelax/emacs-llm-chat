@@ -30,7 +30,7 @@
   "Send PROMPT to llm PLATFORM."
   (let ((display-buffer-alist
          '(("\\*llm\\*"
-            (llm-api--display-buffer-reuse-llm-api-or-ellama-or-scratch)
+            (llm-chat--display-buffer-reuse-llm-api-or-ellama-or-scratch)
             (reusable-frames . visible)))))
     (llm-chat--send platform prompt)))
 
@@ -65,7 +65,7 @@
 
 (defun llm-chat--clear-history (platform)
   "Clear chat history for PLATFORM."
-  (let ((buffer (llm-api--platform-chat-buffer platform)))
+  (let ((buffer llm-chat--buffer))
     (llm-api--clear-history platform)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
@@ -77,13 +77,13 @@
   (let* ((models (llm-api--get-available-models platform))
          (choice (completing-read "Model: " models)))
     (llm-api--set-selected-model platform choice)
-    (llm-api-clear-history platform)
+    (llm-chat--clear-history platform)
     (message "Model changed to %s" choice)))
 
 (defun llm-chat--kill-process (platform)
   "Kill PLATFORM llm-api process."
   (let ((process (llm-api--platform-process platform))
-        (buffer (llm-api--platform-chat-buffer platform)))
+        (buffer llm-chat--buffer))
     (when (process-live-p process)
       (delete-process process)
       (setf (llm-api--platform-process platform) nil)
@@ -100,11 +100,13 @@
     (let ((quit-llm (lambda ()
                       (interactive)
                       (quit-window t)
+                      (llm-chat--kill-process platform)
+                      (llm-chat--clear-history platform)
                       (kill-buffer buffer)))
           (send-llm (lambda (p)
                       (interactive "s> ")
-                      (llm-api-msg platform p)))
-          (clear-history (lambda () (llm-api--clear-history platform))))
+                      (llm-chat--msg platform p)))
+          (clear-history (lambda () (llm-chat--clear-history platform))))
       (if (featurep 'evil)
           ;; evil
           (progn
@@ -250,7 +252,7 @@ in. Default value is (current-buffer).
 (defun llm-chat-change (change-prompt)
   (llm-chat--change llm-chat--active-platform change-prompt))
 
-(defun llm-clear-history ()
+(defun llm-chat-clear-history ()
   (interactive)
   (llm-chat--clear-history llm-chat--active-platform))
 
