@@ -158,10 +158,11 @@ to the end to make the answer visible."
       (llm-chat--keymap platform llm-chat--buffer)
       (goto-char (point-max))
       (funcall llm-chat-buffer-mode)
-      (insert (format "## %s:\n\n%s\n\n## %s (%s):\n\n"
-                      llm-chat-user-nick prompt llm-chat-assistant-nick
-                      (llm-api--get-model-name platform
-                                               (llm-api--platform-selected-model platform))))
+      (when (not (string-empty-p prompt))
+        (insert (format "## %s:\n\n%s\n\n## %s (%s):\n\n"
+                        llm-chat-user-nick prompt llm-chat-assistant-nick
+                        (llm-api--get-model-name platform
+                                                 (llm-api--platform-selected-model platform)))))
       (let* ((on-insert (lambda (buffer &rest args)
                           (when-let (window (get-buffer-window buffer 'visible))
                             (with-selected-window window
@@ -231,7 +232,6 @@ in. Default value is (current-buffer).
 
 ;; user interface
 
-
 (defun llm-chat-set-platforms (platforms)
   (setq llm-chat--enabled-platforms platforms)
   (setq llm-chat--active-platform (cadr platforms)))
@@ -272,7 +272,7 @@ in. Default value is (current-buffer).
 (defun llm-chat-set-system-prompt ()
   (interactive)
   (let ((prompt (read-string "system> ")))
-    (setf (llm-api--platform-system-prompt llm--active-platform) prompt)))
+    (setf (llm-api--platform-system-prompt llm-chat--active-platform) prompt)))
 
 (defun llm-chat-get-system-prompt ()
   (message "SYSTEM: %s" (llm-api--platform-system-prompt llm-chat--active-platform)))
