@@ -72,6 +72,12 @@
         (erase-buffer)))
     (message "History cleared")))
 
+(defun llm-chat--regenerate (platform)
+  (llm-api--remove-last-from-history platform)
+  (llm-chat--insert-platform-header platform)
+  (llm-chat-msg "")
+  (message "Regenerating"))
+
 (defun llm-chat--select-model (platform)
   "Select a different model for PLATFORM."
   (let* ((models (llm-api--get-available-models platform))
@@ -95,7 +101,7 @@
 ;; keys
 
 (defun llm-chat--keymap (platform buffer)
-  "Keymap for llm-api chat with PLATFORM in BUFFER."
+  "Keyjap for llm-api chat with PLATFORM in BUFFER."
   (with-current-buffer buffer
     (let ((quit-llm (lambda ()
                       (interactive)
@@ -106,18 +112,21 @@
           (send-llm (lambda (p)
                       (interactive "s> ")
                       (llm-chat--msg platform p)))
-          (clear-history (lambda () (llm-chat--clear-history platform))))
+          (clear-history (lambda () (llm-chat--clear-history platform)))
+          (regenerate (lambda () (llm-chat--regenerate platform))))
       (if (featurep 'evil)
           ;; evil
           (progn
             (evil-local-set-key 'normal (kbd "RET") send-llm)
             (evil-local-set-key 'normal (kbd "q") quit-llm)
+            (evil-local-set-key 'normal (kbd "r") regenerate)
             (evil-local-set-key 'normal (kbd "<backspace>") clear-history))
         ;; not evil
         (let ((chat-keymap (copy-keymap (current-local-map))))
           (use-local-map chat-keymap)
           (local-set-key (kbd "RET") send-llm)
           (local-set-key (kbd "q") quit-llm)
+          (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "<backspace>") clear-history))))))
 
 
@@ -260,9 +269,7 @@ in. Default value is (current-buffer).
 
 (defun llm-chat-regenerate ()
   (interactive)
-  (llm-api--remove-last-from-history llm-chat--active-platform)
-  (llm-chat--insert-platform-header llm-chat--active-platform)
-  (llm-chat-msg ""))
+  (llm-chat--regenerate llm-chat--active-platform))
 
 (defun llm-chat-about (prompt)
   (llm-chat--about llm-chat--active-platform prompt))
