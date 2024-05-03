@@ -75,7 +75,7 @@
 (defun llm-chat--regenerate (platform)
   (llm-api--remove-last-from-history platform)
   (llm-chat--insert-platform-header platform)
-  (llm-chat-msg "")
+  (llm-chat--msg platform "")
   (message "Regenerating"))
 
 (defun llm-chat--select-model (platform)
@@ -113,7 +113,9 @@
                       (interactive "s> ")
                       (llm-chat--msg platform p)))
           (clear-history (lambda () (llm-chat--clear-history platform)))
-          (regenerate (lambda () (llm-chat--regenerate platform))))
+          (regenerate (lambda ()
+                        (interactive)
+                        (llm-chat--regenerate platform))))
       (if (featurep 'evil)
           ;; evil
           (progn
