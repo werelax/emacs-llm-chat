@@ -178,6 +178,18 @@ to the end to make the answer visible."
                           :on-insert on-insert
                           :on-finish on-finish)))))
 
+(defun llm-chat--insert-platform-header (platform)
+  "Insert PLATFORM header."
+  (let ((buf-name (or llm-chat-buffer-name "*llm*"))
+        (buffer llm-chat--buffer))
+    (when (not (buffer-live-p buffer))
+      (setq llm-chat--buffer (get-buffer-create buf-name)))
+    (with-current-buffer llm-chat--buffer
+      (insert (format "## %s (%s):\n\n"
+                      llm-chat-assistant-nick
+                      (llm-api--get-model-name platform
+                                               (llm-api--platform-selected-model platform)))))))
+
 (defun llm-chat--stream (platform prompt &rest args)
   "Query PLATFORM for PROMPT.
 ARGS contains keys for fine control.
@@ -245,6 +257,12 @@ in. Default value is (current-buffer).
 
 (defun llm-chat-msg (prompt)
   (llm-chat--msg llm-chat--active-platform prompt))
+
+(defun llm-chat-regenerate ()
+  (interactive)
+  (llm-api--remove-last-from-history llm-chat--active-platform)
+  (llm-chat--insert-platform-header llm-chat--active-platform)
+  (llm-chat-msg ""))
 
 (defun llm-chat-about (prompt)
   (llm-chat--about llm-chat--active-platform prompt))
