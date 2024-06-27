@@ -175,9 +175,11 @@ to the end to make the answer visible."
                         (llm-api--get-model-name platform
                                                  (llm-api--platform-selected-model platform)))))
       (let* ((on-insert (lambda (buffer &rest args)
-                          (when-let (window (get-buffer-window buffer 'visible))
-                            (with-selected-window window
-                              (goto-char (point-max))))))
+                          ;; NOTE: this code was commented to disable automatic scroll when generating
+                          ;; (when-let (window (get-buffer-window buffer 'visible))
+                          ;;   (with-selected-window window
+                          ;;     (goto-char (point-max))))
+                          ))
              (on-finish (lambda (buffer &rest args)
                           (with-current-buffer buffer
                             (insert "\n\n")
