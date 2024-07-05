@@ -162,7 +162,8 @@ to the end to make the answer visible."
   (let ((buf-name (or llm-chat-buffer-name "*llm*"))
         (buffer llm-chat--buffer))
     (when (not (buffer-live-p buffer))
-      (setq llm-chat--buffer (get-buffer-create buf-name)))
+      (setq llm-chat--buffer (get-buffer-create buf-name))
+      (setq buffer llm-chat--buffer))
     (with-current-buffer llm-chat--buffer
       (display-buffer llm-chat--buffer)
       (llm-chat--keymap platform llm-chat--buffer)
