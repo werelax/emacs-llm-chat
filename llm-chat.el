@@ -131,7 +131,6 @@
           (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "<backspace>") clear-history))))))
 
-
 ;; private functions
 
 (defun llm-chat--display-buffer-reuse-llm-api-or-ellama-or-scratch (buffer alist)
@@ -167,13 +166,18 @@ to the end to make the answer visible."
     (with-current-buffer llm-chat--buffer
       (display-buffer llm-chat--buffer)
       (llm-chat--keymap platform llm-chat--buffer)
-      (goto-char (point-max))
+      ;; (goto-char (point-max))
       (funcall llm-chat-buffer-mode)
       (when (not (string-empty-p prompt))
         (insert (format "## %s:\n\n%s\n\n## %s (%s):\n\n"
                         llm-chat-user-nick prompt llm-chat-assistant-nick
                         (llm-api--get-model-name platform
-                                                 (llm-api--platform-selected-model platform)))))
+                                                 (llm-api--platform-selected-model platform))))
+        (goto-char (point-max))
+        (let ((windows (get-buffer-window-list buffer nil t)))
+          (dolist (window windows)
+            (set-window-point window (point-max))
+            (with-selected-window window (recenter 3)))))
       (let* ((on-insert (lambda (buffer &rest args)
                           ;; NOTE: this code was commented to disable automatic scroll when generating
                           ;; (when-let (window (get-buffer-window buffer 'visible))
@@ -182,7 +186,9 @@ to the end to make the answer visible."
                           ))
              (on-finish (lambda (buffer &rest args)
                           (with-current-buffer buffer
-                            (insert "\n\n")
+                            (save-excursion
+                              (goto-char (point-max))
+                              (insert "\n\n"))
                             (funcall on-insert buffer)
                             (spinner-stop)))))
         (llm-chat--stream platform
