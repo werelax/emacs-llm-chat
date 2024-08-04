@@ -39,7 +39,9 @@
   (let ((text (if (region-active-p)
                   (buffer-substring-no-properties (region-beginning) (region-end))
                 (buffer-substring-no-properties (point-min) (point-max)))))
-    (llm-chat--msg platform (format "Text:\n%s\nRegarding this text, %s" text prompt))))
+    ;; (llm-chat--msg platform (format "Text:\n%s\nRegarding this text, %s" text prompt))
+    (llm-chat--msg platform (format "Regarding this text, %s:\n\n```text\n%s\n```" prompt text))
+    ))
 
 (defun llm-chat--change (platform change-prompt)
   "Change selected text with PLATFORM according to provided CHANGE-PROMPT."
