@@ -170,13 +170,18 @@ Returns the history in the format expected by llm-api."
           (clear-history (lambda () (llm-chat--clear-history platform)))
           (regenerate (lambda ()
                         (interactive)
-                        (llm-chat--regenerate platform))))
+                        (llm-chat--regenerate platform)))
+          (commit-changes (lambda ()
+                            (interactive)
+                            (llm-chat-commit-changes))))
       (if (featurep 'evil)
           ;; evil
           (progn
             (evil-local-set-key 'normal (kbd "RET") send-llm)
             (evil-local-set-key 'normal (kbd "q") quit-llm)
             (evil-local-set-key 'normal (kbd "r") regenerate)
+            (evil-local-set-key 'normal (kbd ";") commit-changes)
+            (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
             (evil-local-set-key 'normal (kbd "<backspace>") clear-history))
         ;; not evil
         (let ((chat-keymap (copy-keymap (current-local-map))))
@@ -184,6 +189,7 @@ Returns the history in the format expected by llm-api."
           (local-set-key (kbd "RET") send-llm)
           (local-set-key (kbd "q") quit-llm)
           (local-set-key (kbd "r") regenerate)
+          (local-set-key (kbd "C-c C-;") commit-changes)
           (local-set-key (kbd "<backspace>") clear-history))))))
 
 ;; private functions
