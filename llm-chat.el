@@ -26,6 +26,58 @@
 (defvar llm-chat--enabled-platforms '())
 (defvar llm-chat--active-platform nil)
 
+;; Message markers and properties
+(defvar llm-chat--message-markers nil
+  "List of message markers in the current buffer.
+Each element is a plist with :type (user or assistant), :start and :end markers.")
+
+(defun llm-chat--create-marker-pair (start end type)
+  "Create marker pair for message of TYPE between START and END positions."
+  (let ((start-marker (make-marker))
+        (end-marker (make-marker)))
+    (set-marker start-marker start)
+    (set-marker end-marker end)
+    (list :type type :start start-marker :end end-marker)))
+
+(defun llm-chat--add-message-markers (start end type)
+  "Add message markers for a message of TYPE between START and END."
+  (push (llm-chat--create-marker-pair start end type)
+        llm-chat--message-markers))
+
+(defun llm-chat--clear-message-markers ()
+  "Clear all message markers in the current buffer."
+  (dolist (marker-pair llm-chat--message-markers)
+    (set-marker (plist-get marker-pair :start) nil)
+    (set-marker (plist-get marker-pair :end) nil))
+  (setq llm-chat--message-markers nil))
+
+(defun llm-chat--extract-messages ()
+  "Extract all messages from the current buffer using markers.
+Returns the history in the format expected by llm-api."
+  (let (history
+        (sorted-markers (sort (copy-sequence llm-chat--message-markers)
+                              (lambda (a b)
+                                (< (marker-position (plist-get a :start))
+                                   (marker-position (plist-get b :start)))))))
+    (dolist (marker sorted-markers)
+      (let* ((type (plist-get marker :type))
+             (start (plist-get marker :start))
+             (end (plist-get marker :end))
+             (content (string-trim (buffer-substring-no-properties start end)))
+             (role (if (eq type 'user) :user :assistant)))
+        (push `((:role . ,role)
+                (:content . ,content))
+              history)))
+    (nreverse history)))
+
+(defun llm-chat-commit-changes ()
+  "Read current buffer state and update the chat history."
+  (interactive)
+  (let* ((history (llm-chat--extract-messages))
+         (platform llm-chat--active-platform))
+    (setf (llm-api--platform-history platform) history)
+    (message "Chat history updated successfully")))
+
 (defun llm-chat--msg (platform prompt)
   "Send PROMPT to llm PLATFORM."
   (let ((display-buffer-alist
@@ -69,6 +121,7 @@
   "Clear chat history for PLATFORM."
   (let ((buffer llm-chat--buffer))
     (llm-api--clear-history platform)
+    (llm-chat--clear-message-markers)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (erase-buffer)))
@@ -170,18 +223,40 @@ to the end to make the answer visible."
       (display-buffer llm-chat--buffer)
       (llm-chat--keymap platform llm-chat--buffer)
       ;; (goto-char (point-max))
-      (funcall llm-chat-buffer-mode)
+      (unless (eq major-mode llm-chat-buffer-mode)
+        (funcall llm-chat-buffer-mode))
       (when (not (string-empty-p prompt))
-        (insert (format "## %s:\n\n%s\n\n## %s (%s):\n\n"
-                        llm-chat-user-nick prompt llm-chat-assistant-nick
+
+        ;; Insert user message header
+        (goto-char (point-max))
+        (insert (format "## %s:\n\n" llm-chat-user-nick))
+
+        ;; Add markers for user message content
+        (let ((start (point)))
+          (insert prompt "\n\n")
+          (llm-chat--add-message-markers start (point) 'user))
+
+        ;; Insert assistant header
+        (insert (format "## %s (%s):\n\n"
+                        llm-chat-assistant-nick
                         (llm-api--get-model-name platform
                                                  (llm-api--platform-selected-model platform))))
+        
+        ;; Add markers for assistant message (content will be streamed)
         (goto-char (point-max))
+        (let ((assist-start (point)))
+          (llm-chat--add-message-markers assist-start assist-start 'assistant))
+
         (let ((windows (get-buffer-window-list buffer nil t)))
           (dolist (window windows)
             (set-window-point window (point-max))
             (with-selected-window window (recenter 3)))))
+
       (let* ((on-insert (lambda (buffer &rest args)
+                          ;; Update the end marker of the last assistant message
+                          (when-let ((last-marker (car llm-chat--message-markers)))
+                            (when (eq (plist-get last-marker :type) 'assistant)
+                              (set-marker (plist-get last-marker :end) (point-max))))
                           ;; NOTE: this code was commented to disable automatic scroll when generating
                           ;; (when-let (window (get-buffer-window buffer 'visible))
                           ;;   (with-selected-window window
