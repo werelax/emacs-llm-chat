@@ -333,17 +333,26 @@ in. Default value is (current-buffer).
                                        prompt
                                        :on-data insert-text
                                        :on-finish (lambda ()
-                                                    ;; (message "last:" (llm-api--platform-last-response platform))
-                                                    (llm-api--add-generated-message-to-history platform)
-                                                    (llm-api--on-generation-finish-hook platform)
-                                                    ;; (message "HISTORY: %s" (llm-api--platform-history platform))
+                                                    (llm-api--add-response-to-history platform)
                                                     (with-current-buffer buffer
                                                       (when on-finish
                                                         (funcall on-finish buffer
                                                                  :start start
                                                                  :end end
                                                                  :text (buffer-substring-no-properties start end)))
-                                                      (spinner-stop)))))))))
+                                                      (spinner-stop)))
+                                       :on-error (lambda (err-msg _partial)
+                                                   ;; Don't add partial response to history
+                                                   ;; Insert error message in buffer
+                                                   (with-current-buffer buffer
+                                                     (save-excursion
+                                                       (goto-char end)
+                                                       (insert (format "\n\n[Error: %s]\n\n" err-msg)))
+                                                     ;; Update assistant end marker
+                                                     (when on-insert
+                                                       (funcall on-insert buffer :start start :end end))
+                                                     (spinner-stop))
+                                                   (message "llm-chat error: %s" err-msg)))))))))
 
 ;; user interface
 
