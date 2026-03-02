@@ -16,6 +16,7 @@
 (defvar llm-chat-widget-header-keymap
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "TAB") #'llm-chat-widget-toggle-at-point)
+    (define-key map [tab] #'llm-chat-widget-toggle-at-point)
     (define-key map (kbd "RET") #'llm-chat-widget-toggle-at-point)
     (define-key map [mouse-1] #'llm-chat-widget-toggle-at-point)
     map)
