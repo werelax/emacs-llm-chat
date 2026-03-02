@@ -182,6 +182,10 @@ Returns the history in the format expected by llm-api."
           ;; evil
           (progn
             (evil-local-set-key 'normal (kbd "RET") send-llm)
+            ;; Explicit widget toggles for terminal/evil key handling consistency
+            (evil-local-set-key 'normal (kbd "TAB") #'llm-chat-widget-toggle-at-point)
+            (evil-local-set-key 'normal (kbd "<tab>") #'llm-chat-widget-toggle-at-point)
+            (evil-local-set-key 'normal (kbd "C-i") #'llm-chat-widget-toggle-at-point)
             (evil-local-set-key 'normal (kbd "q") quit-llm)
             (evil-local-set-key 'normal (kbd "r") regenerate)
             (evil-local-set-key 'normal (kbd ";") commit-changes)
@@ -191,6 +195,10 @@ Returns the history in the format expected by llm-api."
         (let ((chat-keymap (copy-keymap (current-local-map))))
           (use-local-map chat-keymap)
           (local-set-key (kbd "RET") send-llm)
+          ;; Explicit widget toggles for terminal key handling consistency
+          (local-set-key (kbd "TAB") #'llm-chat-widget-toggle-at-point)
+          (local-set-key (kbd "<tab>") #'llm-chat-widget-toggle-at-point)
+          (local-set-key (kbd "C-i") #'llm-chat-widget-toggle-at-point)
           (local-set-key (kbd "q") quit-llm)
           (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "C-c C-;") commit-changes)
@@ -230,7 +238,9 @@ to the end to make the answer visible."
       (setq llm-chat--buffer (get-buffer-create buf-name))
       (setq buffer llm-chat--buffer))
     (with-current-buffer llm-chat--buffer
-      (display-buffer llm-chat--buffer)
+      (let ((window (display-buffer llm-chat--buffer)))
+        (when (window-live-p window)
+          (select-window window)))
       ;; (goto-char (point-max))
       (unless (eq major-mode llm-chat-buffer-mode)
         (funcall llm-chat-buffer-mode)
@@ -321,11 +331,32 @@ in. Default value is (current-buffer).
                ;; Widget state
                (tool-widgets (make-hash-table :test 'eql))
                (reasoning-widget-cell (list nil))
+               ;; Insert one visual blank line before the next normal text
+               ;; chunk after widget blocks (reasoning/tools).
+               (widget-gap-pending (list nil))
                ;; Core text insertion
                (insert-text (lambda (text)
                               ;; Remove the annoying leading space
                               (when (= start end)
                                 (setq text (s-trim-left text)))
+                              ;; If widgets were just emitted/finalized, ensure one
+                              ;; blank line before the first visible text chunk.
+                              (when (and (car widget-gap-pending)
+                                         (string-match-p "\\S-" text))
+                                (with-current-buffer (marker-buffer end)
+                                  (save-excursion
+                                    (goto-char end)
+                                    (let ((nl 0)
+                                          (pos (point)))
+                                      (while (and (> pos (point-min))
+                                                  (eq (char-before pos) ?\n))
+                                        (setq nl (1+ nl)
+                                              pos (1- pos)))
+                                      (cond
+                                       ((>= nl 2) nil)
+                                       ((= nl 1) (insert "\n"))
+                                       (t (insert "\n\n"))))))
+                                (setcar widget-gap-pending nil))
                               ;; Insert buffer at the end
                               (with-current-buffer (marker-buffer end)
                                 (save-excursion
@@ -342,7 +373,8 @@ in. Default value is (current-buffer).
                                   (let ((widget (llm-chat-widget-create-tool
                                                  buffer (marker-position end)
                                                  name args-str)))
-                                    (puthash idx widget tool-widgets)))))
+                                    (puthash idx widget tool-widgets)
+                                    (setcar widget-gap-pending t)))))
                (on-tool-done (lambda (idx name result-str)
                                (when (buffer-live-p buffer)
                                  (let ((widget (gethash idx tool-widgets)))
@@ -350,7 +382,8 @@ in. Default value is (current-buffer).
                                      (llm-chat-widget-update-tool
                                       widget
                                       (if (string-prefix-p "[Error:" result-str) :error :success)
-                                      result-str))))))
+                                      result-str)
+                                     (setcar widget-gap-pending t))))))
                (on-reasoning (lambda (text)
                                (when (buffer-live-p buffer)
                                  (unless (car reasoning-widget-cell)
@@ -364,6 +397,9 @@ in. Default value is (current-buffer).
                                                    (car reasoning-widget-cell))
                                           (llm-chat-widget-finalize-reasoning
                                            (car reasoning-widget-cell))
+                                          ;; Ensure next normal content starts after
+                                          ;; a visual blank line below widget blocks.
+                                          (setcar widget-gap-pending t)
                                           ;; Reset for next tool-loop iteration
                                           (setcar reasoning-widget-cell nil)))))
           (set-marker start point)

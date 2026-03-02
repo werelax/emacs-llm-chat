@@ -15,8 +15,8 @@
 
 (defvar llm-chat-widget-header-keymap
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "TAB") #'llm-chat-widget-toggle-at-point)
-    (define-key map [tab] #'llm-chat-widget-toggle-at-point)
+    ;; TAB/C-i handling is done at buffer keymap level in llm-chat.el.
+    ;; Keep header-local toggles for RET and mouse interaction.
     (define-key map (kbd "RET") #'llm-chat-widget-toggle-at-point)
     (define-key map [mouse-1] #'llm-chat-widget-toggle-at-point)
     map)
