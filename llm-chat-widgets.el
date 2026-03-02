@@ -282,7 +282,14 @@ Returns the widget plist."
 (defun llm-chat-widget-toggle-at-point ()
   "Toggle the widget at point."
   (interactive)
-  (let ((id (get-text-property (point) 'llm-chat-widget-id)))
+  (let* ((p (point))
+         ;; Be tolerant around cursor edge cases in terminal/evil: if point sits
+         ;; just before/after the header text, still resolve the widget.
+         (id (or (get-text-property p 'llm-chat-widget-id)
+                 (and (< p (point-max))
+                      (get-text-property (1+ p) 'llm-chat-widget-id))
+                 (and (> p (point-min))
+                      (get-text-property (1- p) 'llm-chat-widget-id)))))
     (when id
       (let ((widget (llm-chat-widget--find id)))
         (when widget
