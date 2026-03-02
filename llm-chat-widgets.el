@@ -271,8 +271,11 @@ Returns the widget plist."
                 (goto-char body-end)
                 (insert "\n")
                 (setq body-end (point)))
-              ;; Fix overlay to exact body region and stop growing
-              (move-overlay body-ov body-start body-end))))))))
+              ;; Freeze reasoning overlay: replace growing overlay with fixed one.
+              (delete-overlay body-ov)
+              (plist-put widget :body-ov
+                         (llm-chat-widget--make-body-overlay
+                          body-start body-end collapsed)))))))))
 
 ;; Toggle
 
