@@ -329,5 +329,18 @@ Returns the widget plist."
                          'llm-chat-widget-header-face)))
             (llm-chat-widget--replace-header widget new-header face)))))))
 
+(defun llm-chat-widget-clear-all (&optional buffer)
+  "Clear all widget overlays/state from BUFFER (or current buffer)."
+  (with-current-buffer (or buffer (current-buffer))
+    (dolist (widget llm-chat-widgets)
+      (when-let* ((ov (plist-get widget :body-ov)))
+        (when (overlayp ov)
+          (delete-overlay ov)))
+      (when-let* ((start (plist-get widget :start)))
+        (when (markerp start)
+          (set-marker start nil))))
+    (setq llm-chat-widgets nil)
+    (setq llm-chat-widgets--counter 0)))
+
 (provide 'llm-chat-widgets)
 ;;; llm-chat-widgets.el ends here

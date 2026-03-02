@@ -35,6 +35,9 @@
 (defvar llm-chat--enabled-platforms '())
 (defvar llm-chat--active-platform nil)
 
+(defvar llm-chat--branches-by-platform (make-hash-table :test 'eq)
+  "Branch states keyed by platform object.")
+
 ;; Message markers and properties
 (defvar llm-chat--message-markers nil
   "List of message markers in the current buffer.
@@ -60,6 +63,146 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
     (set-marker (plist-get marker-pair :end) nil))
   (setq llm-chat--message-markers nil))
 
+;; Branching
+
+(defun llm-chat--history-copy (history)
+  "Deep-copy chat HISTORY list."
+  (copy-tree history))
+
+(defun llm-chat--branch-init-state (platform)
+  "Create initial branch state for PLATFORM."
+  (let ((branches (make-hash-table :test 'eql)))
+    (puthash 1 (list :id 1
+                     :parent-id nil
+                     :name "main"
+                     :history (llm-chat--history-copy (llm-api--platform-history platform)))
+             branches)
+    (list :next-id 2 :current-id 1 :branches branches)))
+
+(defun llm-chat--branch-state (platform)
+  "Get or initialize branch state for PLATFORM."
+  (or (gethash platform llm-chat--branches-by-platform)
+      (let ((state (llm-chat--branch-init-state platform)))
+        (puthash platform state llm-chat--branches-by-platform)
+        state)))
+
+(defun llm-chat--branch-current (platform)
+  "Get current branch plist for PLATFORM."
+  (let* ((state (llm-chat--branch-state platform))
+         (branches (plist-get state :branches))
+         (current-id (plist-get state :current-id)))
+    (gethash current-id branches)))
+
+(defun llm-chat--sync-platform-history-from-chat-buffer (platform)
+  "Sync PLATFORM history from `llm-chat--buffer' marker extraction."
+  (when (and platform (buffer-live-p llm-chat--buffer))
+    (with-current-buffer llm-chat--buffer
+      (setf (llm-api--platform-history platform) (llm-chat--extract-messages))
+      (llm-chat--branch-save-current platform))))
+
+(defun llm-chat--branch-save-current (platform)
+  "Save PLATFORM current history snapshot into the active branch."
+  (when platform
+    (let* ((state (llm-chat--branch-state platform))
+           (branches (plist-get state :branches))
+           (current-id (plist-get state :current-id))
+           (branch (gethash current-id branches)))
+      (when branch
+        (puthash current-id
+                 (plist-put (copy-tree branch)
+                            :history (llm-chat--history-copy (llm-api--platform-history platform)))
+                 branches)))))
+
+(defun llm-chat--render-history (platform)
+  "Render PLATFORM history into `llm-chat--buffer', rebuilding markers."
+  (let ((buf-name (or llm-chat-buffer-name "*llm*"))
+        (history (llm-api--platform-history platform)))
+    (unless (buffer-live-p llm-chat--buffer)
+      (setq llm-chat--buffer (get-buffer-create buf-name)))
+    (with-current-buffer llm-chat--buffer
+      (let ((window (display-buffer llm-chat--buffer))
+            (inhibit-read-only t))
+        (when (window-live-p window)
+          (select-window window))
+        (unless (eq major-mode llm-chat-buffer-mode)
+          (funcall llm-chat-buffer-mode)
+          (setq-local font-lock-extra-managed-props
+                      (seq-difference font-lock-extra-managed-props
+                                      '(invisible keymap rear-nonsticky))))
+        (llm-chat--keymap platform llm-chat--buffer)
+        (when (fboundp 'llm-chat-widget-clear-all)
+          (llm-chat-widget-clear-all (current-buffer)))
+        (erase-buffer)
+        (llm-chat--clear-message-markers)
+        (dolist (msg history)
+          (let ((role (alist-get :role msg))
+                (content (alist-get :content msg)))
+            (cond
+             ((and (eq role :user) (stringp content))
+              (insert (format "## %s:\n\n" llm-chat-user-nick))
+              (let ((start (point)))
+                (insert content "\n\n")
+                (llm-chat--add-message-markers start (point) 'user)))
+             ((and (eq role :assistant) (stringp content))
+              (insert (format "## %s (%s):\n\n"
+                              llm-chat-assistant-nick
+                              (llm-api--get-model-name platform
+                                                       (llm-api--platform-selected-model platform))))
+              (let ((start (point)))
+                (insert content "\n\n")
+                (llm-chat--add-message-markers start (point) 'assistant))))))
+        (goto-char (point-max))))))
+
+(defun llm-chat--branch-create (platform &optional name)
+  "Create and switch to a new branch on PLATFORM."
+  (let* ((state (llm-chat--branch-state platform))
+         (branches (plist-get state :branches))
+         (parent-id (plist-get state :current-id))
+         (id (plist-get state :next-id))
+         (branch-name (if (and name (not (string-empty-p name)))
+                          name
+                        (format "branch-%d" id)))
+         (branch (list :id id
+                       :parent-id parent-id
+                       :name branch-name
+                       :history (llm-chat--history-copy (llm-api--platform-history platform)))))
+    (puthash id branch branches)
+    (plist-put state :next-id (1+ id))
+    (plist-put state :current-id id)
+    branch))
+
+(defun llm-chat--branch-switch-to (platform branch-id)
+  "Switch PLATFORM to BRANCH-ID and render its history."
+  (let* ((state (llm-chat--branch-state platform))
+         (branches (plist-get state :branches))
+         (branch (gethash branch-id branches)))
+    (when branch
+      (llm-chat--branch-save-current platform)
+      (plist-put state :current-id branch-id)
+      (setf (llm-api--platform-history platform)
+            (llm-chat--history-copy (plist-get branch :history)))
+      (llm-chat--render-history platform)
+      branch)))
+
+(defun llm-chat--extract-assistant-content (start end)
+  "Extract assistant content between START and END, excluding widget regions."
+  (let ((segments '())
+        (seg-start nil)
+        (pos start))
+    (while (< pos end)
+      (let ((widget-char-p (or (get-text-property pos 'llm-chat-widget-id)
+                               (get-char-property pos 'llm-chat-widget-body))))
+        (if widget-char-p
+            (when seg-start
+              (push (buffer-substring-no-properties seg-start pos) segments)
+              (setq seg-start nil))
+          (unless seg-start
+            (setq seg-start pos))))
+      (setq pos (1+ pos)))
+    (when seg-start
+      (push (buffer-substring-no-properties seg-start end) segments))
+    (string-trim (apply #'concat (nreverse segments)))))
+
 (defun llm-chat--extract-messages ()
   "Extract all messages from the current buffer using markers.
 Returns the history in the format expected by llm-api."
@@ -70,9 +213,11 @@ Returns the history in the format expected by llm-api."
                                    (marker-position (plist-get b :start)))))))
     (dolist (marker sorted-markers)
       (let* ((type (plist-get marker :type))
-             (start (plist-get marker :start))
-             (end (plist-get marker :end))
-             (content (string-trim (buffer-substring-no-properties start end)))
+             (start (marker-position (plist-get marker :start)))
+             (end (marker-position (plist-get marker :end)))
+             (content (if (eq type 'assistant)
+                          (llm-chat--extract-assistant-content start end)
+                        (string-trim (buffer-substring-no-properties start end))))
              (role (if (eq type 'user) :user :assistant)))
         (push `((:role . ,role)
                 (:content . ,content))
@@ -82,10 +227,14 @@ Returns the history in the format expected by llm-api."
 (defun llm-chat-commit-changes ()
   "Read current buffer state and update the chat history."
   (interactive)
-  (let* ((history (llm-chat--extract-messages))
-         (platform llm-chat--active-platform))
-    (setf (llm-api--platform-history platform) history)
-    (message "Chat history updated successfully")))
+  (let* ((platform llm-chat--active-platform)
+         (process (llm-api--platform-process platform)))
+    (when (process-live-p process)
+      (user-error "Cannot commit changes while generation is in progress"))
+    (let ((history (llm-chat--extract-messages)))
+      (setf (llm-api--platform-history platform) history)
+      (llm-chat--branch-save-current platform)
+      (message "Chat history updated successfully"))))
 
 (defun llm-chat--msg (platform prompt)
   "Send PROMPT to llm PLATFORM."
@@ -130,15 +279,41 @@ Returns the history in the format expected by llm-api."
   "Clear chat history for PLATFORM."
   (let ((buffer llm-chat--buffer))
     (llm-api--clear-history platform)
+    (llm-chat--branch-save-current platform)
     (llm-chat--clear-message-markers)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
+        (when (fboundp 'llm-chat-widget-clear-all)
+          (llm-chat-widget-clear-all (current-buffer)))
         (erase-buffer)))
     (message "History cleared")))
 
+(defun llm-chat--remove-last-assistant-from-buffer ()
+  "Remove the last assistant block from `llm-chat--buffer' and marker list."
+  (when (buffer-live-p llm-chat--buffer)
+    (with-current-buffer llm-chat--buffer
+      (when-let* ((marker-pair (seq-find (lambda (m) (eq (plist-get m :type) 'assistant))
+                                          llm-chat--message-markers))
+                  (start (marker-position (plist-get marker-pair :start))))
+        (let ((delete-start (save-excursion
+                              (goto-char start)
+                              (if (re-search-backward "^## " nil t)
+                                  (point)
+                                start))))
+          ;; Regenerate always targets the last assistant; trim from its header to EOB.
+          (delete-region delete-start (point-max)))
+        (set-marker (plist-get marker-pair :start) nil)
+        (set-marker (plist-get marker-pair :end) nil)
+        (setq llm-chat--message-markers (delq marker-pair llm-chat--message-markers))))))
+
 (defun llm-chat--regenerate (platform)
   (llm-api--remove-last-from-history platform)
+  (llm-chat--remove-last-assistant-from-buffer)
   (llm-chat--insert-platform-header platform)
+  (with-current-buffer llm-chat--buffer
+    (goto-char (point-max))
+    (let ((assist-start (point)))
+      (llm-chat--add-message-markers assist-start assist-start 'assistant)))
   (llm-chat--msg platform "")
   (message "Regenerating"))
 
@@ -237,6 +412,8 @@ to the end to make the answer visible."
 
 (defun llm-chat--send (platform prompt)
   "Send PROMPT to PLATFORM."
+  (when (process-live-p (llm-api--platform-process platform))
+    (user-error "Generation is still running; wait or kill it before sending a new prompt"))
   (let ((buf-name (or llm-chat-buffer-name "*llm*"))
         (buffer llm-chat--buffer))
     (when (not (buffer-live-p buffer))
@@ -412,34 +589,40 @@ in. Default value is (current-buffer).
           (set-marker-insertion-type start nil)
           (set-marker-insertion-type end t)
           (spinner-start llm-chat-spinner-type)
-          (llm-api--generate-streaming platform
-                                       prompt
-                                       :on-data insert-text
-                                       :on-finish (lambda ()
-                                                    (llm-api--add-response-to-history platform)
-                                                    (with-current-buffer buffer
-                                                      (when on-finish
-                                                        (funcall on-finish buffer
-                                                                 :start start
-                                                                 :end end
-                                                                 :text (buffer-substring-no-properties start end)))
-                                                      (spinner-stop)))
-                                       :on-error (lambda (err-msg _partial)
-                                                   ;; Don't add partial response to history
-                                                   ;; Insert error message in buffer
-                                                   (with-current-buffer buffer
-                                                     (save-excursion
-                                                       (goto-char end)
-                                                       (insert (format "\n\n[Error: %s]\n\n" err-msg)))
-                                                     ;; Update assistant end marker
-                                                     (when on-insert
-                                                       (funcall on-insert buffer :start start :end end))
-                                                     (spinner-stop))
-                                                   (message "llm-chat error: %s" err-msg))
-                                       :on-tool-start on-tool-start
-                                       :on-tool-done on-tool-done
-                                       :on-reasoning on-reasoning
-                                       :on-reasoning-finalize on-reasoning-finalize))))))
+          ;; Explicit history mutation: generation now runs from current history.
+          (when (not (string-empty-p prompt))
+            (llm-api--add-user-message platform prompt))
+          (llm-api--generate-streaming-from-history
+           platform
+           :on-data insert-text
+           :on-finish (lambda ()
+                        (llm-api--add-response-to-history platform)
+                        (llm-chat--branch-save-current platform)
+                        (with-current-buffer buffer
+                          (when on-finish
+                            (funcall on-finish buffer
+                                     :start start
+                                     :end end
+                                     :text (buffer-substring-no-properties start end)))
+                          (spinner-stop)))
+           :on-error (lambda (err-msg _partial)
+                       ;; Don't add partial response to history
+                       ;; Insert error message in buffer
+                       (with-current-buffer buffer
+                         (save-excursion
+                           (goto-char end)
+                           (insert (format "\n\n[Error: %s]\n\n" err-msg)))
+                         ;; Update assistant end marker
+                         (when on-insert
+                           (funcall on-insert buffer :start start :end end))
+                         (spinner-stop))
+                       ;; user message may already be in history; keep branch snapshot in sync
+                       (llm-chat--branch-save-current platform)
+                       (message "llm-chat error: %s" err-msg))
+           :on-tool-start on-tool-start
+           :on-tool-done on-tool-done
+           :on-reasoning on-reasoning
+           :on-reasoning-finalize on-reasoning-finalize))))))
 
 ;; user interface
 
@@ -453,14 +636,18 @@ in. Default value is (current-buffer).
           (cond
            (current-valid current)
            (preferred preferred)
-           ((cadr platforms))))))
+           ((cadr platforms))))
+    (when llm-chat--active-platform
+      (llm-chat--branch-state llm-chat--active-platform))))
 
 (defun llm-chat-select-platform ()
   (interactive)
   (let ((platforms (cl-loop for (key nil) on llm-chat--enabled-platforms by #'cddr
                             collect key)))
     (let ((choice (completing-read "> " platforms)))
-      (setq llm-chat--active-platform (plist-get llm-chat--enabled-platforms (intern choice))))))
+      (setq llm-chat--active-platform (plist-get llm-chat--enabled-platforms (intern choice)))
+      (llm-chat--branch-state llm-chat--active-platform)
+      (llm-chat--render-history llm-chat--active-platform))))
 
 (defun llm-chat-msg (prompt)
   (llm-chat--msg llm-chat--active-platform prompt))
@@ -486,6 +673,91 @@ in. Default value is (current-buffer).
 (defun llm-chat-select-model ()
   (interactive)
   (llm-chat--select-model llm-chat--active-platform))
+
+(defun llm-chat-branch-new (name)
+  "Create and switch to a new chat branch from current history.
+When NAME is empty, an automatic branch name is used."
+  (interactive "sBranch name (empty=auto): ")
+  (llm-chat--branch-save-current llm-chat--active-platform)
+  (let ((branch (llm-chat--branch-create llm-chat--active-platform name)))
+    (message "Switched to branch %s (#%d)"
+             (plist-get branch :name)
+             (plist-get branch :id))))
+
+(defun llm-chat-branch-switch ()
+  "Switch to another branch for the active platform."
+  (interactive)
+  (llm-chat--branch-save-current llm-chat--active-platform)
+  (let* ((state (llm-chat--branch-state llm-chat--active-platform))
+         (branches (plist-get state :branches))
+         (choices '()))
+    (maphash (lambda (id branch)
+               (push (cons (format "#%d %s (parent:%s, msgs:%d)%s"
+                                   id
+                                   (plist-get branch :name)
+                                   (or (plist-get branch :parent-id) "-")
+                                   (length (plist-get branch :history))
+                                   (if (= id (plist-get state :current-id)) " *" ""))
+                           id)
+                     choices))
+             branches)
+    (let* ((choice (completing-read "Branch: " (mapcar #'car choices) nil t))
+           (id (cdr (assoc choice choices)))
+           (branch (and id (llm-chat--branch-switch-to llm-chat--active-platform id))))
+      (when branch
+        (message "Switched to branch %s (#%d)"
+                 (plist-get branch :name)
+                 (plist-get branch :id))))))
+
+(defun llm-chat-branch-next ()
+  "Cycle to next branch by numeric ID."
+  (interactive)
+  (llm-chat--branch-save-current llm-chat--active-platform)
+  (let* ((state (llm-chat--branch-state llm-chat--active-platform))
+         (branches (plist-get state :branches))
+         (current-id (plist-get state :current-id))
+         (ids '()))
+    (maphash (lambda (id _branch) (push id ids)) branches)
+    (setq ids (sort ids #'<))
+    (when ids
+      (let* ((idx (or (cl-position current-id ids) 0))
+             (next-id (nth (mod (1+ idx) (length ids)) ids))
+             (branch (llm-chat--branch-switch-to llm-chat--active-platform next-id)))
+        (when branch
+          (message "Switched to branch %s (#%d)"
+                   (plist-get branch :name)
+                   (plist-get branch :id)))))))
+
+(defun llm-chat-branch-prev ()
+  "Cycle to previous branch by numeric ID."
+  (interactive)
+  (llm-chat--branch-save-current llm-chat--active-platform)
+  (let* ((state (llm-chat--branch-state llm-chat--active-platform))
+         (branches (plist-get state :branches))
+         (current-id (plist-get state :current-id))
+         (ids '()))
+    (maphash (lambda (id _branch) (push id ids)) branches)
+    (setq ids (sort ids #'<))
+    (when ids
+      (let* ((idx (or (cl-position current-id ids) 0))
+             (prev-id (nth (mod (1- idx) (length ids)) ids))
+             (branch (llm-chat--branch-switch-to llm-chat--active-platform prev-id)))
+        (when branch
+          (message "Switched to branch %s (#%d)"
+                   (plist-get branch :name)
+                   (plist-get branch :id)))))))
+
+(defun llm-chat-regenerate-from-edited-history ()
+  "Commit current chat buffer edits, then regenerate assistant response."
+  (interactive)
+  (llm-chat--sync-platform-history-from-chat-buffer llm-chat--active-platform)
+  (llm-chat--regenerate llm-chat--active-platform))
+
+(defun llm-chat-branch-new-from-edited-history (name)
+  "Commit current chat buffer edits, then create/switch to a new branch."
+  (interactive "sBranch name (empty=auto): ")
+  (llm-chat--sync-platform-history-from-chat-buffer llm-chat--active-platform)
+  (llm-chat-branch-new name))
 
 (defun llm-chat-interactive-chat-about ()
   (interactive)
