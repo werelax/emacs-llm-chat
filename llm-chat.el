@@ -93,6 +93,24 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
          (current-id (plist-get state :current-id)))
     (gethash current-id branches)))
 
+(defun llm-chat--update-header-line (platform)
+  "Update chat buffer header-line metadata for PLATFORM."
+  (when (buffer-live-p llm-chat--buffer)
+    (with-current-buffer llm-chat--buffer
+      (if (not platform)
+          (setq-local header-line-format nil)
+        (let* ((selected-model (llm-api--platform-selected-model platform))
+               (model-name (if selected-model
+                               (llm-api--get-model-name platform selected-model)
+                             "-"))
+               (platform-name (llm-api--platform-name platform))
+               (branch (llm-chat--branch-current platform))
+               (branch-id (or (plist-get branch :id) "?"))
+               (branch-name (or (plist-get branch :name) "main")))
+          (setq-local header-line-format
+                      (format " LLM:%s | Model:%s | Branch:%s (#%s)"
+                              platform-name model-name branch-name branch-id)))))))
+
 (defun llm-chat--sync-platform-history-from-chat-buffer (platform)
   "Sync PLATFORM history from `llm-chat--buffer' marker extraction."
   (when (and platform (buffer-live-p llm-chat--buffer))
@@ -130,6 +148,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
                       (seq-difference font-lock-extra-managed-props
                                       '(invisible keymap rear-nonsticky))))
         (llm-chat--keymap platform llm-chat--buffer)
+        (llm-chat--update-header-line platform)
         (when (fboundp 'llm-chat-widget-clear-all)
           (llm-chat-widget-clear-all (current-buffer)))
         (erase-buffer)
@@ -323,6 +342,7 @@ Returns the history in the format expected by llm-api."
          (choice (completing-read "Model: " models)))
     (llm-api--set-selected-model platform choice)
     (llm-chat--clear-history platform)
+    (llm-chat--update-header-line platform)
     (message "Model changed to %s" choice)))
 
 (defun llm-chat--kill-process (platform)
@@ -357,7 +377,19 @@ Returns the history in the format expected by llm-api."
                         (llm-chat--regenerate platform)))
           (commit-changes (lambda ()
                             (interactive)
-                            (llm-chat-commit-changes))))
+                            (llm-chat-commit-changes)))
+          (branch-new (lambda ()
+                        (interactive)
+                        (call-interactively #'llm-chat-branch-new)))
+          (branch-switch (lambda ()
+                           (interactive)
+                           (llm-chat-branch-switch)))
+          (branch-next (lambda ()
+                         (interactive)
+                         (llm-chat-branch-next)))
+          (branch-prev (lambda ()
+                         (interactive)
+                         (llm-chat-branch-prev))))
       (if (featurep 'evil)
           ;; evil
           (progn
@@ -370,6 +402,10 @@ Returns the history in the format expected by llm-api."
             (evil-local-set-key 'normal (kbd "r") regenerate)
             (evil-local-set-key 'normal (kbd ";") commit-changes)
             (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
+            (evil-local-set-key 'normal (kbd "C-c b c") branch-new)
+            (evil-local-set-key 'normal (kbd "C-c b s") branch-switch)
+            (evil-local-set-key 'normal (kbd "C-c b n") branch-next)
+            (evil-local-set-key 'normal (kbd "C-c b p") branch-prev)
             (evil-local-set-key 'normal (kbd "<backspace>") clear-history))
         ;; not evil
         (let ((chat-keymap (copy-keymap (current-local-map))))
@@ -382,6 +418,10 @@ Returns the history in the format expected by llm-api."
           (local-set-key (kbd "q") quit-llm)
           (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "C-c C-;") commit-changes)
+          (local-set-key (kbd "C-c b c") branch-new)
+          (local-set-key (kbd "C-c b s") branch-switch)
+          (local-set-key (kbd "C-c b n") branch-next)
+          (local-set-key (kbd "C-c b p") branch-prev)
           (local-set-key (kbd "<backspace>") clear-history))))))
 
 ;; private functions
@@ -431,6 +471,7 @@ to the end to make the answer visible."
                     (seq-difference font-lock-extra-managed-props
                                    '(invisible keymap rear-nonsticky))))
       (llm-chat--keymap platform llm-chat--buffer)
+      (llm-chat--update-header-line platform)
       (when (not (string-empty-p prompt))
 
         ;; Insert user message header
@@ -638,7 +679,8 @@ in. Default value is (current-buffer).
            (preferred preferred)
            ((cadr platforms))))
     (when llm-chat--active-platform
-      (llm-chat--branch-state llm-chat--active-platform))))
+      (llm-chat--branch-state llm-chat--active-platform)
+      (llm-chat--update-header-line llm-chat--active-platform))))
 
 (defun llm-chat-select-platform ()
   (interactive)
@@ -680,6 +722,7 @@ When NAME is empty, an automatic branch name is used."
   (interactive "sBranch name (empty=auto): ")
   (llm-chat--branch-save-current llm-chat--active-platform)
   (let ((branch (llm-chat--branch-create llm-chat--active-platform name)))
+    (llm-chat--update-header-line llm-chat--active-platform)
     (message "Switched to branch %s (#%d)"
              (plist-get branch :name)
              (plist-get branch :id))))
