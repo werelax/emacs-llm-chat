@@ -2,6 +2,10 @@
 
 (require 'llm-api)
 
+;; Load widgets from same directory
+(let ((base-dir (file-name-directory (or load-file-name buffer-file-name))))
+  (load (expand-file-name "llm-chat-widgets.el" base-dir)))
+
 (defcustom llm-chat-buffer-name "*llm*" "Default llm-chat buffer."
   :group 'llm-chat
   :type 'string)
@@ -227,10 +231,14 @@ to the end to make the answer visible."
       (setq buffer llm-chat--buffer))
     (with-current-buffer llm-chat--buffer
       (display-buffer llm-chat--buffer)
-      (llm-chat--keymap platform llm-chat--buffer)
       ;; (goto-char (point-max))
       (unless (eq major-mode llm-chat-buffer-mode)
-        (funcall llm-chat-buffer-mode))
+        (funcall llm-chat-buffer-mode)
+        ;; Prevent font-lock from stripping widget text properties
+        (setq-local font-lock-extra-managed-props
+                    (seq-difference font-lock-extra-managed-props
+                                   '(invisible keymap rear-nonsticky))))
+      (llm-chat--keymap platform llm-chat--buffer)
       (when (not (string-empty-p prompt))
 
         ;; Insert user message header
@@ -260,7 +268,7 @@ to the end to make the answer visible."
 
       (let* ((on-insert (lambda (buffer &rest args)
                           ;; Update the end marker of the last assistant message
-                          (when-let ((last-marker (car llm-chat--message-markers)))
+                          (when-let* ((last-marker (car llm-chat--message-markers)))
                             (when (eq (plist-get last-marker :type) 'assistant)
                               (set-marker (plist-get last-marker :end) (point-max))))
                           ;; NOTE: this code was commented to disable automatic scroll when generating
@@ -310,6 +318,10 @@ in. Default value is (current-buffer).
       (save-excursion
         (let* ((start (make-marker))
                (end (make-marker))
+               ;; Widget state
+               (tool-widgets (make-hash-table :test 'eql))
+               (reasoning-widget-cell (list nil))
+               ;; Core text insertion
                (insert-text (lambda (text)
                               ;; Remove the annoying leading space
                               (when (= start end)
@@ -323,7 +335,37 @@ in. Default value is (current-buffer).
                                 (when on-insert (funcall on-insert buffer
                                                          :start start
                                                          :end end
-                                                         :text text))))))
+                                                         :text text)))))
+               ;; Widget callbacks
+               (on-tool-start (lambda (idx name args-str)
+                                (when (buffer-live-p buffer)
+                                  (let ((widget (llm-chat-widget-create-tool
+                                                 buffer (marker-position end)
+                                                 name args-str)))
+                                    (puthash idx widget tool-widgets)))))
+               (on-tool-done (lambda (idx name result-str)
+                               (when (buffer-live-p buffer)
+                                 (let ((widget (gethash idx tool-widgets)))
+                                   (when widget
+                                     (llm-chat-widget-update-tool
+                                      widget
+                                      (if (string-prefix-p "[Error:" result-str) :error :success)
+                                      result-str))))))
+               (on-reasoning (lambda (text)
+                               (when (buffer-live-p buffer)
+                                 (unless (car reasoning-widget-cell)
+                                   (setcar reasoning-widget-cell
+                                           (llm-chat-widget-create-reasoning
+                                            buffer (marker-position end))))
+                                 (llm-chat-widget-append-reasoning
+                                  (car reasoning-widget-cell) text))))
+               (on-reasoning-finalize (lambda ()
+                                        (when (and (buffer-live-p buffer)
+                                                   (car reasoning-widget-cell))
+                                          (llm-chat-widget-finalize-reasoning
+                                           (car reasoning-widget-cell))
+                                          ;; Reset for next tool-loop iteration
+                                          (setcar reasoning-widget-cell nil)))))
           (set-marker start point)
           (set-marker end point)
           (set-marker-insertion-type start nil)
@@ -352,7 +394,11 @@ in. Default value is (current-buffer).
                                                      (when on-insert
                                                        (funcall on-insert buffer :start start :end end))
                                                      (spinner-stop))
-                                                   (message "llm-chat error: %s" err-msg)))))))))
+                                                   (message "llm-chat error: %s" err-msg))
+                                       :on-tool-start on-tool-start
+                                       :on-tool-done on-tool-done
+                                       :on-reasoning on-reasoning
+                                       :on-reasoning-finalize on-reasoning-finalize))))))
 
 ;; user interface
 
@@ -414,3 +460,6 @@ in. Default value is (current-buffer).
   (let ((prompt (read-string "temp> ")))
     (setf (llm-api--platform-params llm-chat--active-platform)
           (plist-put (llm-api--platform-params llm-chat--active-platform) :temperature (string-to-number prompt)))))
+
+(provide 'llm-chat)
+;;; llm-chat.el ends here
