@@ -26,6 +26,11 @@
   :group 'llm-chat
   :type 'symbol)
 
+(defcustom llm-chat-default-platform-key :minimax
+  "Preferred default platform key when initializing platforms."
+  :group 'llm-chat
+  :type 'symbol)
+
 (defvar llm-chat--buffer nil)
 (defvar llm-chat--enabled-platforms '())
 (defvar llm-chat--active-platform nil)
@@ -440,7 +445,15 @@ in. Default value is (current-buffer).
 
 (defun llm-chat-set-platforms (platforms)
   (setq llm-chat--enabled-platforms platforms)
-  (setq llm-chat--active-platform (cadr platforms)))
+  (let* ((current llm-chat--active-platform)
+         (current-valid (cl-loop for (_k v) on platforms by #'cddr
+                                 thereis (eq v current)))
+         (preferred (plist-get platforms llm-chat-default-platform-key)))
+    (setq llm-chat--active-platform
+          (cond
+           (current-valid current)
+           (preferred preferred)
+           ((cadr platforms))))))
 
 (defun llm-chat-select-platform ()
   (interactive)
