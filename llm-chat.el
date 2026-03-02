@@ -359,8 +359,25 @@ Returns the history in the format expected by llm-api."
 
 ;; keys
 
+(defvar llm-chat--which-key-registered nil
+  "Whether llm-chat which-key replacements were registered.")
+
+(defun llm-chat--register-which-key-bindings ()
+  "Register human-friendly which-key labels for llm-chat bindings."
+  (when (and (not llm-chat--which-key-registered)
+             (fboundp 'which-key-add-key-based-replacements))
+    (which-key-add-key-based-replacements
+      "C-c b" "llm branches"
+      "C-c b c" "create branch"
+      "C-c b s" "switch branch"
+      "C-c b n" "next branch"
+      "C-c b p" "previous branch"
+      "C-c C-;" "commit edited history")
+    (setq llm-chat--which-key-registered t)))
+
 (defun llm-chat--keymap (platform buffer)
   "Keyjap for llm-api chat with PLATFORM in BUFFER."
+  (llm-chat--register-which-key-bindings)
   (with-current-buffer buffer
     (let ((quit-llm (lambda ()
                       (interactive)
@@ -377,19 +394,7 @@ Returns the history in the format expected by llm-api."
                         (llm-chat--regenerate platform)))
           (commit-changes (lambda ()
                             (interactive)
-                            (llm-chat-commit-changes)))
-          (branch-new (lambda ()
-                        (interactive)
-                        (call-interactively #'llm-chat-branch-new)))
-          (branch-switch (lambda ()
-                           (interactive)
-                           (llm-chat-branch-switch)))
-          (branch-next (lambda ()
-                         (interactive)
-                         (llm-chat-branch-next)))
-          (branch-prev (lambda ()
-                         (interactive)
-                         (llm-chat-branch-prev))))
+                            (llm-chat-commit-changes))))
       (if (featurep 'evil)
           ;; evil
           (progn
@@ -402,10 +407,10 @@ Returns the history in the format expected by llm-api."
             (evil-local-set-key 'normal (kbd "r") regenerate)
             (evil-local-set-key 'normal (kbd ";") commit-changes)
             (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
-            (evil-local-set-key 'normal (kbd "C-c b c") branch-new)
-            (evil-local-set-key 'normal (kbd "C-c b s") branch-switch)
-            (evil-local-set-key 'normal (kbd "C-c b n") branch-next)
-            (evil-local-set-key 'normal (kbd "C-c b p") branch-prev)
+            (evil-local-set-key 'normal (kbd "C-c b c") #'llm-chat-branch-new)
+            (evil-local-set-key 'normal (kbd "C-c b s") #'llm-chat-branch-switch)
+            (evil-local-set-key 'normal (kbd "C-c b n") #'llm-chat-branch-next)
+            (evil-local-set-key 'normal (kbd "C-c b p") #'llm-chat-branch-prev)
             (evil-local-set-key 'normal (kbd "<backspace>") clear-history))
         ;; not evil
         (let ((chat-keymap (copy-keymap (current-local-map))))
@@ -418,10 +423,10 @@ Returns the history in the format expected by llm-api."
           (local-set-key (kbd "q") quit-llm)
           (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "C-c C-;") commit-changes)
-          (local-set-key (kbd "C-c b c") branch-new)
-          (local-set-key (kbd "C-c b s") branch-switch)
-          (local-set-key (kbd "C-c b n") branch-next)
-          (local-set-key (kbd "C-c b p") branch-prev)
+          (local-set-key (kbd "C-c b c") #'llm-chat-branch-new)
+          (local-set-key (kbd "C-c b s") #'llm-chat-branch-switch)
+          (local-set-key (kbd "C-c b n") #'llm-chat-branch-next)
+          (local-set-key (kbd "C-c b p") #'llm-chat-branch-prev)
           (local-set-key (kbd "<backspace>") clear-history))))))
 
 ;; private functions
