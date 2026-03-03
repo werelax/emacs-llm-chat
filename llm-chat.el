@@ -807,6 +807,10 @@ Returns plist (:count N :selected MODEL-ID :changed BOOL)."
           ;; evil
           (progn
             (evil-local-set-key 'normal (kbd "RET") send-llm)
+            ;; Keep vertical movement aligned with visible lines in chat buffer.
+            ;; This avoids landing on hidden collapsed widget body newlines.
+            (evil-local-set-key 'normal (kbd "j") #'next-line)
+            (evil-local-set-key 'normal (kbd "k") #'previous-line)
             ;; Explicit widget toggles for terminal/evil key handling consistency
             (evil-local-set-key 'normal (kbd "TAB") #'llm-chat-widget-toggle-at-point)
             (evil-local-set-key 'normal (kbd "<tab>") #'llm-chat-widget-toggle-at-point)
