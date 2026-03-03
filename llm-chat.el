@@ -121,20 +121,45 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
                (pct (plist-get usage :percent-used))
                (ctx-str (cond
                          ((and (numberp ctx) (> ctx 0) (numberp used) (numberp pct))
-                          (format " | Ctx:~%s/%s (%d%%)"
+                          (format " | ~%s/%s (%d%%%%)"
                                   (llm-chat--format-token-count used)
                                   (llm-chat--format-token-count ctx)
                                   (truncate pct)))
                          ((and (numberp ctx) (numberp used))
-                          (format " | Ctx:~%s/%s"
+                          (format " | ~%s/%s"
                                   (llm-chat--format-token-count used)
                                   (llm-chat--format-token-count ctx)))
                          ((numberp ctx)
-                          (format " | Ctx:%s" (llm-chat--format-token-count ctx)))
-                         (t ""))))
-          (setq-local header-line-format
-                      (format " LLM:%s | Model:%s%s | Branch:%s (#%s)"
-                              platform-name model-name ctx-str branch-name branch-id)))))))
+                          (format " | %s" (llm-chat--format-token-count ctx)))
+                         (t "")))
+               (prefix (format " %s/" platform-name))
+               (branch-str (format " | %s (#%s)" branch-name branch-id))
+               (model-str model-name)
+               (line "")
+               (win (get-buffer-window (current-buffer) t))
+               (width (max 20 (if (window-live-p win)
+                                  (window-body-width win)
+                                (frame-width)))))
+          (setq line (concat prefix model-str ctx-str branch-str))
+          (when (> (string-width line) width)
+            (let ((available (- width
+                                (string-width prefix)
+                                (string-width ctx-str)
+                                (string-width branch-str))))
+              (setq model-str
+                    (truncate-string-to-width model-str (max 8 available) nil nil "…"))
+              (setq line (concat prefix model-str ctx-str branch-str))))
+          (when (and (not (string-empty-p ctx-str)) (> (string-width line) width))
+            (setq ctx-str "")
+            (setq line (concat prefix model-str ctx-str branch-str)))
+          (when (> (string-width line) width)
+            (let ((available (- width
+                                (string-width prefix)
+                                (string-width branch-str))))
+              (setq model-str
+                    (truncate-string-to-width model-str (max 4 available) nil nil "…"))
+              (setq line (concat prefix model-str ctx-str branch-str))))
+          (setq-local header-line-format line))))))
 
 (defun llm-chat--sync-platform-history-from-chat-buffer (platform)
   "Sync PLATFORM history from `llm-chat--buffer' marker extraction."
@@ -164,10 +189,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
     (unless (buffer-live-p llm-chat--buffer)
       (setq llm-chat--buffer (get-buffer-create buf-name)))
     (with-current-buffer llm-chat--buffer
-      (let ((window (display-buffer llm-chat--buffer))
-            (inhibit-read-only t))
-        (when (window-live-p window)
-          (select-window window))
+      (let ((inhibit-read-only t))
         (unless (eq major-mode llm-chat-buffer-mode)
           (funcall llm-chat-buffer-mode)
           (setq-local font-lock-extra-managed-props
