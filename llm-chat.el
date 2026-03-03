@@ -115,10 +115,23 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
                (branch (llm-chat--branch-current platform))
                (branch-id (or (plist-get branch :id) "?"))
                (branch-name (or (plist-get branch :name) "main"))
-               (ctx (llm-api--get-model-context-window platform selected-model))
-               (ctx-str (if (numberp ctx)
-                            (format " | Ctx:%s" (llm-chat--format-token-count ctx))
-                          "")))
+               (usage (llm-api--get-context-usage platform selected-model))
+               (ctx (plist-get usage :context-window))
+               (used (plist-get usage :used-tokens))
+               (pct (plist-get usage :percent-used))
+               (ctx-str (cond
+                         ((and (numberp ctx) (> ctx 0) (numberp used) (numberp pct))
+                          (format " | Ctx:~%s/%s (%d%%)"
+                                  (llm-chat--format-token-count used)
+                                  (llm-chat--format-token-count ctx)
+                                  (truncate pct)))
+                         ((and (numberp ctx) (numberp used))
+                          (format " | Ctx:~%s/%s"
+                                  (llm-chat--format-token-count used)
+                                  (llm-chat--format-token-count ctx)))
+                         ((numberp ctx)
+                          (format " | Ctx:%s" (llm-chat--format-token-count ctx)))
+                         (t ""))))
           (setq-local header-line-format
                       (format " LLM:%s | Model:%s%s | Branch:%s (#%s)"
                               platform-name model-name ctx-str branch-name branch-id)))))))
@@ -819,20 +832,27 @@ With prefix arg REFRESH-ALL, refresh all enabled platforms."
                   (error-message-string err)))))))
 
 (defun llm-chat-show-model-limits ()
-  "Show known context/output limits for current model."
+  "Show known context/output limits and estimated current usage." 
   (interactive)
   (let* ((platform llm-chat--active-platform)
          (selected-model (llm-api--platform-selected-model platform))
          (model-name (llm-api--get-model-name platform selected-model))
          (caps (llm-api--get-model-capabilities platform selected-model))
+         (usage (llm-api--get-context-usage platform selected-model))
          (ctx (plist-get caps :context-window))
          (max-out (plist-get caps :max-output-tokens))
-         (src (plist-get caps :source)))
+         (src (plist-get caps :source))
+         (used (plist-get usage :used-tokens))
+         (remaining (plist-get usage :remaining-tokens))
+         (pct (plist-get usage :percent-used)))
     (if (not caps)
         (message "No model capability metadata known for %s" model-name)
-      (message "Model %s | context: %s | max-output: %s | source: %s"
+      (message "Model %s | context: %s | used: ~%s (%s%%) | remaining: ~%s | max-output: %s | source: %s"
                model-name
                (if (numberp ctx) (llm-chat--format-token-count ctx) "unknown")
+               (if (numberp used) (llm-chat--format-token-count used) "unknown")
+               (if (numberp pct) (number-to-string (truncate pct)) "?")
+               (if (numberp remaining) (llm-chat--format-token-count remaining) "unknown")
                (if (numberp max-out) (llm-chat--format-token-count max-out) "unknown")
                (or src :unknown)))))
 
