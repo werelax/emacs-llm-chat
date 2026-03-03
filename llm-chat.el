@@ -93,6 +93,14 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
          (current-id (plist-get state :current-id)))
     (gethash current-id branches)))
 
+(defun llm-chat--format-token-count (n)
+  "Format token count N as compact human string."
+  (cond
+   ((not (numberp n)) "?")
+   ((>= n 1000000) (format "%.1fM" (/ n 1000000.0)))
+   ((>= n 1000) (format "%.1fk" (/ n 1000.0)))
+   (t (number-to-string n))))
+
 (defun llm-chat--update-header-line (platform)
   "Update chat buffer header-line metadata for PLATFORM."
   (when (buffer-live-p llm-chat--buffer)
@@ -106,10 +114,14 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
                (platform-name (llm-api--platform-name platform))
                (branch (llm-chat--branch-current platform))
                (branch-id (or (plist-get branch :id) "?"))
-               (branch-name (or (plist-get branch :name) "main")))
+               (branch-name (or (plist-get branch :name) "main"))
+               (ctx (llm-api--get-model-context-window platform selected-model))
+               (ctx-str (if (numberp ctx)
+                            (format " | Ctx:%s" (llm-chat--format-token-count ctx))
+                          "")))
           (setq-local header-line-format
-                      (format " LLM:%s | Model:%s | Branch:%s (#%s)"
-                              platform-name model-name branch-name branch-id)))))))
+                      (format " LLM:%s | Model:%s%s | Branch:%s (#%s)"
+                              platform-name model-name ctx-str branch-name branch-id)))))))
 
 (defun llm-chat--sync-platform-history-from-chat-buffer (platform)
   "Sync PLATFORM history from `llm-chat--buffer' marker extraction."
@@ -360,7 +372,9 @@ Returns the history in the format expected by llm-api."
 ;; keys
 
 (defvar llm-chat--which-key-registered nil
-  "Whether llm-chat which-key replacements were registered.")
+  "Whether llm-chat which-key replacements are already registered.")
+
+(setq llm-chat--which-key-registered nil)
 
 (defun llm-chat--register-which-key-bindings ()
   "Register human-friendly which-key labels for llm-chat bindings."
@@ -372,7 +386,8 @@ Returns the history in the format expected by llm-api."
       "C-c b s" "switch branch"
       "C-c b n" "next branch"
       "C-c b p" "previous branch"
-      "C-c C-;" "commit edited history")
+      "C-c C-;" "commit edited history"
+      "C-c C-l" "show model limits")
     (setq llm-chat--which-key-registered t)))
 
 (defun llm-chat--keymap (platform buffer)
@@ -407,6 +422,7 @@ Returns the history in the format expected by llm-api."
             (evil-local-set-key 'normal (kbd "r") regenerate)
             (evil-local-set-key 'normal (kbd ";") commit-changes)
             (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
+            (evil-local-set-key 'normal (kbd "C-c C-l") #'llm-chat-show-model-limits)
             (evil-local-set-key 'normal (kbd "C-c b c") #'llm-chat-branch-new)
             (evil-local-set-key 'normal (kbd "C-c b s") #'llm-chat-branch-switch)
             (evil-local-set-key 'normal (kbd "C-c b n") #'llm-chat-branch-next)
@@ -423,6 +439,7 @@ Returns the history in the format expected by llm-api."
           (local-set-key (kbd "q") quit-llm)
           (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "C-c C-;") commit-changes)
+          (local-set-key (kbd "C-c C-l") #'llm-chat-show-model-limits)
           (local-set-key (kbd "C-c b c") #'llm-chat-branch-new)
           (local-set-key (kbd "C-c b s") #'llm-chat-branch-switch)
           (local-set-key (kbd "C-c b n") #'llm-chat-branch-next)
@@ -720,6 +737,24 @@ in. Default value is (current-buffer).
 (defun llm-chat-select-model ()
   (interactive)
   (llm-chat--select-model llm-chat--active-platform))
+
+(defun llm-chat-show-model-limits ()
+  "Show known context/output limits for current model."
+  (interactive)
+  (let* ((platform llm-chat--active-platform)
+         (selected-model (llm-api--platform-selected-model platform))
+         (model-name (llm-api--get-model-name platform selected-model))
+         (caps (llm-api--get-model-capabilities platform selected-model))
+         (ctx (plist-get caps :context-window))
+         (max-out (plist-get caps :max-output-tokens))
+         (src (plist-get caps :source)))
+    (if (not caps)
+        (message "No model capability metadata known for %s" model-name)
+      (message "Model %s | context: %s | max-output: %s | source: %s"
+               model-name
+               (if (numberp ctx) (llm-chat--format-token-count ctx) "unknown")
+               (if (numberp max-out) (llm-chat--format-token-count max-out) "unknown")
+               (or src :unknown)))))
 
 (defun llm-chat-branch-new (name)
   "Create and switch to a new chat branch from current history.
