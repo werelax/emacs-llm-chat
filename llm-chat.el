@@ -31,6 +31,36 @@
   :group 'llm-chat
   :type 'symbol)
 
+(defcustom llm-chat-compaction-tail-turns 5
+  "How many recent user turns to keep verbatim when compacting context."
+  :group 'llm-chat
+  :type 'integer)
+
+(defcustom llm-chat-compaction-warning-threshold 85
+  "Warn when estimated/known context usage percent reaches this threshold."
+  :group 'llm-chat
+  :type 'integer)
+
+(defcustom llm-chat-compaction-critical-threshold 95
+  "Show critical warning when context usage percent reaches this threshold."
+  :group 'llm-chat
+  :type 'integer)
+
+(defcustom llm-chat-compaction-max-output-tokens 2000
+  "Max tokens requested for compaction summary generation."
+  :group 'llm-chat
+  :type 'integer)
+
+(defcustom llm-chat-compaction-temperature 0.2
+  "Sampling temperature used for compaction summary generation."
+  :group 'llm-chat
+  :type 'number)
+
+(defcustom llm-chat-compaction-timeout-seconds 120
+  "Timeout in seconds for compaction summary generation."
+  :group 'llm-chat
+  :type 'integer)
+
 (defvar llm-chat--buffer nil)
 (defvar llm-chat--enabled-platforms '())
 (defvar llm-chat--active-platform nil)
@@ -75,7 +105,12 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
     (puthash 1 (list :id 1
                      :parent-id nil
                      :name "main"
-                     :history (llm-chat--history-copy (llm-api--platform-history platform)))
+                     :history (llm-chat--history-copy (llm-api--platform-history platform))
+                     :context-compaction-summary nil
+                     :context-compaction-version 0
+                     :context-compaction-updated-at nil
+                     :context-compaction-last-error nil
+                     :context-compaction-last-warning-revision nil)
              branches)
     (list :next-id 2 :current-id 1 :branches branches)))
 
@@ -92,6 +127,84 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
          (branches (plist-get state :branches))
          (current-id (plist-get state :current-id)))
     (gethash current-id branches)))
+
+(defun llm-chat--branch-set-current-prop (platform key value)
+  "Set current branch KEY to VALUE for PLATFORM."
+  (let* ((state (llm-chat--branch-state platform))
+         (branches (plist-get state :branches))
+         (current-id (plist-get state :current-id))
+         (branch (copy-tree (gethash current-id branches))))
+    (when branch
+      (puthash current-id (plist-put branch key value) branches)
+      value)))
+
+(defun llm-chat--branch-get-current-prop (platform key)
+  "Get KEY from current PLATFORM branch." 
+  (plist-get (llm-chat--branch-current platform) key))
+
+(defun llm-chat--sync-platform-compaction-summary-from-branch (platform)
+  "Apply current branch compaction summary to PLATFORM request context."
+  (setf (llm-api--platform-context-compaction-summary platform)
+        (llm-chat--branch-get-current-prop platform :context-compaction-summary)))
+
+(defun llm-chat--set-current-branch-compaction-summary (platform summary)
+  "Set current branch compaction SUMMARY for PLATFORM and sync to platform."
+  (let* ((version (or (llm-chat--branch-get-current-prop platform :context-compaction-version) 0))
+         (normalized (and (stringp summary) (string-trim summary))))
+    (llm-chat--branch-set-current-prop platform :context-compaction-summary normalized)
+    (llm-chat--branch-set-current-prop platform :context-compaction-version (1+ version))
+    (llm-chat--branch-set-current-prop platform :context-compaction-updated-at (current-time-string))
+    (llm-chat--branch-set-current-prop platform :context-compaction-last-error nil)
+    (llm-chat--sync-platform-compaction-summary-from-branch platform)))
+
+(defun llm-chat--clear-current-branch-compaction-summary (platform)
+  "Clear compaction summary metadata on current PLATFORM branch."
+  (llm-chat--branch-set-current-prop platform :context-compaction-summary nil)
+  (llm-chat--branch-set-current-prop platform :context-compaction-last-error nil)
+  (llm-chat--sync-platform-compaction-summary-from-branch platform))
+
+(defun llm-chat--append-banner (platform text)
+  "Append banner TEXT to llm chat buffer for PLATFORM."
+  (when (buffer-live-p llm-chat--buffer)
+    (with-current-buffer llm-chat--buffer
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (unless (bolp)
+          (insert "\n"))
+        (insert (format "> [!warning] %s\n\n" text))))
+    (llm-chat--branch-save-current platform)))
+
+(defun llm-chat--context-overflow-error-p (err-msg)
+  "Return non-nil when ERR-MSG looks like a context-length overflow." 
+  (and (stringp err-msg)
+       (let ((msg (downcase err-msg)))
+         (or (string-match-p "too many tokens" msg)
+             (string-match-p "prompt is too long" msg)
+             (string-match-p "context length" msg)
+             (string-match-p "token limit" msg)
+             (and (string-match-p "context" msg)
+                  (or (string-match-p "window" msg)
+                      (string-match-p "length" msg)
+                      (string-match-p "limit" msg)
+                      (string-match-p "exceed" msg)))))))
+
+(defun llm-chat--maybe-show-context-pressure-warning (platform)
+  "Append warning banner when PLATFORM context usage is near limit."
+  (let* ((selected-model (llm-api--platform-selected-model platform))
+         (usage (llm-api--get-context-usage platform selected-model))
+         (pct (plist-get usage :percent-used))
+         (rev (llm-api--platform-history-revision platform))
+         (last-rev (llm-chat--branch-get-current-prop platform :context-compaction-last-warning-revision)))
+    (when (and (numberp pct)
+               (numberp rev)
+               (or (not (numberp last-rev)) (/= last-rev rev))
+               (>= pct llm-chat-compaction-warning-threshold))
+      (llm-chat--branch-set-current-prop platform :context-compaction-last-warning-revision rev)
+      (llm-chat--append-banner
+       platform
+       (if (>= pct llm-chat-compaction-critical-threshold)
+           (format "Context usage is high (~%d%%). Consider running M-x llm-chat-compact-context soon." (truncate pct))
+         (format "Context usage is rising (~%d%%). You can run M-x llm-chat-compact-context." (truncate pct)))))))
 
 (defun llm-chat--format-token-count (n)
   "Format token count N as compact human string."
@@ -218,13 +331,15 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
               (let ((start (point)))
                 (insert content "\n\n")
                 (llm-chat--add-message-markers start (point) 'assistant))))))
-        (goto-char (point-max))))))
+        (goto-char (point-max))))
+    (llm-chat--maybe-show-context-pressure-warning platform)))
 
 (defun llm-chat--branch-create (platform &optional name)
   "Create and switch to a new branch on PLATFORM."
   (let* ((state (llm-chat--branch-state platform))
          (branches (plist-get state :branches))
          (parent-id (plist-get state :current-id))
+         (parent-branch (gethash parent-id branches))
          (id (plist-get state :next-id))
          (branch-name (if (and name (not (string-empty-p name)))
                           name
@@ -232,10 +347,16 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
          (branch (list :id id
                        :parent-id parent-id
                        :name branch-name
-                       :history (llm-chat--history-copy (llm-api--platform-history platform)))))
+                       :history (llm-chat--history-copy (llm-api--platform-history platform))
+                       :context-compaction-summary (plist-get parent-branch :context-compaction-summary)
+                       :context-compaction-version (or (plist-get parent-branch :context-compaction-version) 0)
+                       :context-compaction-updated-at (plist-get parent-branch :context-compaction-updated-at)
+                       :context-compaction-last-error nil
+                       :context-compaction-last-warning-revision nil)))
     (puthash id branch branches)
     (plist-put state :next-id (1+ id))
     (plist-put state :current-id id)
+    (llm-chat--sync-platform-compaction-summary-from-branch platform)
     branch))
 
 (defun llm-chat--branch-switch-to (platform branch-id)
@@ -248,6 +369,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
       (plist-put state :current-id branch-id)
       (setf (llm-api--platform-history platform)
             (llm-chat--history-copy (plist-get branch :history)))
+      (llm-chat--sync-platform-compaction-summary-from-branch platform)
       (llm-api--bump-history-revision platform)
       (llm-chat--render-history platform)
       branch)))
@@ -291,6 +413,149 @@ Returns the history in the format expected by llm-api."
                 (:content . ,content))
               history)))
     (nreverse history)))
+
+(defun llm-chat--history-user-message-indices (history)
+  "Return 0-based indices of user messages in HISTORY."
+  (let ((idx 0)
+        (indices '()))
+    (dolist (msg history)
+      (when (eq (alist-get :role msg) :user)
+        (push idx indices))
+      (setq idx (1+ idx)))
+    (nreverse indices)))
+
+(defun llm-chat--split-history-for-compaction (history tail-user-turns)
+  "Split HISTORY into compactable prefix and protected tail.
+Returns plist with keys :compactable, :tail and :split-index." 
+  (let* ((user-indices (llm-chat--history-user-message-indices history))
+         (user-count (length user-indices))
+         (tail-user-turns (max 0 tail-user-turns)))
+    (cond
+     ;; Protect all user turns -> no-op.
+     ((<= user-count tail-user-turns)
+      (list :compactable nil :tail history :split-index 0))
+     ;; Keep zero user turns -> compact the full history.
+     ((= tail-user-turns 0)
+      (list :compactable history :tail nil :split-index (length history)))
+     (t
+      (let* ((split-index (nth (- user-count tail-user-turns) user-indices))
+             (compactable (seq-take history split-index))
+             (tail (seq-drop history split-index)))
+        (list :compactable compactable :tail tail :split-index split-index))))))
+
+(defun llm-chat--message-content-string (value)
+  "Convert message VALUE to readable string for compaction transcript."
+  (cond
+   ((null value) "")
+   ((eq value :json-null) "")
+   ((stringp value) value)
+   (t (condition-case nil
+          (json-encode value)
+        (error (format "%s" value))))))
+
+(defun llm-chat--serialize-message-for-compaction (msg)
+  "Serialize one history MSG into markdown for compaction input."
+  (let* ((role (alist-get :role msg))
+         (role-name (pcase role
+                      (:user "User")
+                      (:assistant "Assistant")
+                      (:tool "Tool")
+                      (_ (format "%s" role))))
+         (content (string-trim (llm-chat--message-content-string (alist-get :content msg))))
+         (tool-calls (alist-get :tool_calls msg))
+         (tool-call-id (alist-get :tool_call_id msg))
+         (extras (delq nil
+                       (list (when tool-call-id
+                               (format "tool_call_id: %s" tool-call-id))
+                             (when tool-calls
+                               (format "tool_calls: %s"
+                                       (llm-chat--message-content-string tool-calls)))))))
+    (string-join
+     (delq nil
+           (list (format "### %s" role-name)
+                 (unless (string-empty-p content) content)
+                 (when extras (string-join extras "\n"))))
+     "\n")))
+
+(defun llm-chat--build-compaction-transcript (messages)
+  "Build markdown transcript from compactable MESSAGES." 
+  (string-join (mapcar #'llm-chat--serialize-message-for-compaction messages) "\n\n"))
+
+(defun llm-chat--build-compaction-request-prompt (previous-summary transcript)
+  "Build prompt for context compaction from PREVIOUS-SUMMARY and TRANSCRIPT."
+  (string-join
+   (delq nil
+         (list
+          "You are compacting previous chat history into durable memory for future turns."
+          "Produce factual markdown only. Do not invent details."
+          "Use exactly these sections:"
+          "## Durable context"
+          "## Decisions"
+          "## Open tasks"
+          "## Technical references"
+          "## Risks / caveats"
+          (when (and (stringp previous-summary) (not (string-empty-p (string-trim previous-summary))))
+            (concat "Previous summary:\n\n" previous-summary))
+          (concat "Conversation history to compact:\n\n" transcript)
+          "Return only the updated summary markdown."))
+   "\n\n"))
+
+(defun llm-chat--clone-platform-for-compaction (platform)
+  "Create a temporary PLATFORM clone for compaction summarization requests."
+  (let* ((type (type-of platform))
+         (ctor (intern (format "%s-create" (symbol-name type))))
+         (ctor (if (fboundp ctor) ctor #'llm-api--platform-create))
+         (params (copy-tree (llm-api--platform-params platform)))
+         (params (plist-put params :temperature llm-chat-compaction-temperature))
+         (params (plist-put params :max_tokens llm-chat-compaction-max-output-tokens)))
+    (funcall ctor
+             :name (llm-api--platform-name platform)
+             :url (llm-api--platform-url platform)
+             :token (llm-api--platform-token platform)
+             :system-prompt "You summarize previous conversation context for continuity."
+             :system-prompt-role (llm-api--platform-system-prompt-role platform)
+             :context-compaction-summary nil
+             :history nil
+             :available-models (copy-tree (llm-api--platform-available-models platform))
+             :selected-model (copy-tree (llm-api--platform-selected-model platform))
+             :params params
+             :process-buffer-name (format "*llm-compaction-%s*" (llm-api--platform-name platform))
+             :tools []
+             :tool-executor nil)))
+
+(defun llm-chat--generate-compaction-summary (platform prompt)
+  "Generate compaction summary for PLATFORM using PROMPT.
+Returns summary string or signals an error." 
+  (let* ((worker (llm-chat--clone-platform-for-compaction platform))
+         (done nil)
+         (failed nil)
+         (err-msg nil)
+         (summary "")
+         (deadline (+ (float-time) llm-chat-compaction-timeout-seconds)))
+    (llm-api--add-user-message worker prompt)
+    (llm-api--generate-streaming-from-history
+     worker
+     :on-data (lambda (text)
+                (when (stringp text)
+                  (setq summary (concat summary text))))
+     :on-finish (lambda ()
+                  (llm-api--add-response-to-history worker)
+                  (setq done t))
+     :on-error (lambda (msg _partial)
+                 (setq failed t
+                       err-msg msg
+                       done t)))
+    (while (and (not done) (< (float-time) deadline))
+      (accept-process-output (llm-api--platform-process worker) 0.1))
+    (unless done
+      (llm-api--kill-process worker)
+      (error "Compaction timed out after %ss" llm-chat-compaction-timeout-seconds))
+    (when failed
+      (error "Compaction failed: %s" err-msg))
+    (setq summary (string-trim summary))
+    (when (string-empty-p summary)
+      (error "Compaction returned an empty summary"))
+    summary))
 
 (defun llm-chat-commit-changes ()
   "Read current buffer state and update the chat history."
@@ -348,6 +613,8 @@ Returns the history in the format expected by llm-api."
   "Clear chat history for PLATFORM."
   (let ((buffer llm-chat--buffer))
     (llm-api--clear-history platform)
+    (llm-chat--clear-current-branch-compaction-summary platform)
+    (llm-chat--branch-set-current-prop platform :context-compaction-last-warning-revision nil)
     (llm-chat--branch-save-current platform)
     (llm-chat--clear-message-markers)
     (when (buffer-live-p buffer)
@@ -470,7 +737,10 @@ Returns plist (:count N :selected MODEL-ID :changed BOOL)."
       "C-c b p" "previous branch"
       "C-c C-;" "commit edited history"
       "C-c C-l" "show model limits"
-      "C-c C-r" "refresh model metadata")
+      "C-c C-r" "refresh model metadata"
+      "C-c C-m" "compact context"
+      "C-c C-v" "show compact summary"
+      "C-c C-k" "clear compact summary")
     (setq llm-chat--which-key-registered t)))
 
 (defun llm-chat--keymap (platform buffer)
@@ -507,6 +777,9 @@ Returns plist (:count N :selected MODEL-ID :changed BOOL)."
             (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
             (evil-local-set-key 'normal (kbd "C-c C-l") #'llm-chat-show-model-limits)
             (evil-local-set-key 'normal (kbd "C-c C-r") #'llm-chat-refresh-model-metadata)
+            (evil-local-set-key 'normal (kbd "C-c C-m") #'llm-chat-compact-context)
+            (evil-local-set-key 'normal (kbd "C-c C-v") #'llm-chat-show-compaction-summary)
+            (evil-local-set-key 'normal (kbd "C-c C-k") #'llm-chat-clear-compaction-summary)
             (evil-local-set-key 'normal (kbd "C-c b c") #'llm-chat-branch-new)
             (evil-local-set-key 'normal (kbd "C-c b s") #'llm-chat-branch-switch)
             (evil-local-set-key 'normal (kbd "C-c b n") #'llm-chat-branch-next)
@@ -525,6 +798,9 @@ Returns plist (:count N :selected MODEL-ID :changed BOOL)."
           (local-set-key (kbd "C-c C-;") commit-changes)
           (local-set-key (kbd "C-c C-l") #'llm-chat-show-model-limits)
           (local-set-key (kbd "C-c C-r") #'llm-chat-refresh-model-metadata)
+          (local-set-key (kbd "C-c C-m") #'llm-chat-compact-context)
+          (local-set-key (kbd "C-c C-v") #'llm-chat-show-compaction-summary)
+          (local-set-key (kbd "C-c C-k") #'llm-chat-clear-compaction-summary)
           (local-set-key (kbd "C-c b c") #'llm-chat-branch-new)
           (local-set-key (kbd "C-c b s") #'llm-chat-branch-switch)
           (local-set-key (kbd "C-c b n") #'llm-chat-branch-next)
@@ -752,7 +1028,8 @@ in. Default value is (current-buffer).
                                      :start start
                                      :end end
                                      :text (buffer-substring-no-properties start end)))
-                          (spinner-stop)))
+                          (spinner-stop))
+                        (llm-chat--maybe-show-context-pressure-warning platform))
            :on-error (lambda (err-msg _partial)
                        ;; Don't add partial response to history
                        ;; Insert error message in buffer
@@ -766,6 +1043,10 @@ in. Default value is (current-buffer).
                          (spinner-stop))
                        ;; user message may already be in history; keep branch snapshot in sync
                        (llm-chat--branch-save-current platform)
+                       (when (llm-chat--context-overflow-error-p err-msg)
+                         (llm-chat--append-banner
+                          platform
+                          "Context limit reached. Run M-x llm-chat-compact-context."))
                        (message "llm-chat error: %s" err-msg))
            :on-tool-start on-tool-start
            :on-tool-done on-tool-done
@@ -787,6 +1068,7 @@ in. Default value is (current-buffer).
            ((cadr platforms))))
     (when llm-chat--active-platform
       (llm-chat--branch-state llm-chat--active-platform)
+      (llm-chat--sync-platform-compaction-summary-from-branch llm-chat--active-platform)
       (llm-chat--update-header-line llm-chat--active-platform))))
 
 (defun llm-chat-select-platform ()
@@ -796,6 +1078,7 @@ in. Default value is (current-buffer).
     (let ((choice (completing-read "> " platforms)))
       (setq llm-chat--active-platform (plist-get llm-chat--enabled-platforms (intern choice)))
       (llm-chat--branch-state llm-chat--active-platform)
+      (llm-chat--sync-platform-compaction-summary-from-branch llm-chat--active-platform)
       (llm-chat--render-history llm-chat--active-platform))))
 
 (defun llm-chat-msg (prompt)
@@ -822,6 +1105,75 @@ in. Default value is (current-buffer).
 (defun llm-chat-select-model ()
   (interactive)
   (llm-chat--select-model llm-chat--active-platform))
+
+(defun llm-chat-compact-context (&optional tail-user-turns)
+  "Manually compact old history into branch-scoped summary memory.
+Keeps TAIL-USER-TURNS recent user turns verbatim (default from custom setting)."
+  (interactive)
+  (let* ((platform llm-chat--active-platform)
+         (tail-user-turns (or tail-user-turns llm-chat-compaction-tail-turns))
+         (process (and platform (llm-api--platform-process platform))))
+    (unless platform
+      (user-error "No active platform"))
+    (when (process-live-p process)
+      (user-error "Generation is still running; wait or kill it before compacting"))
+    ;; Include direct edits from *llm* buffer before compacting.
+    (llm-chat--sync-platform-history-from-chat-buffer platform)
+    (let* ((history (llm-api--platform-history platform))
+           (split (llm-chat--split-history-for-compaction history tail-user-turns))
+           (compactable (plist-get split :compactable))
+           (tail (plist-get split :tail)))
+      (if (or (null compactable) (= (length compactable) 0))
+          (message "Nothing to compact yet (history shorter than protected tail)")
+        (let* ((revision-start (llm-api--platform-history-revision platform))
+               (previous-summary (llm-chat--branch-get-current-prop platform :context-compaction-summary))
+               (transcript (llm-chat--build-compaction-transcript compactable))
+               (prompt (llm-chat--build-compaction-request-prompt previous-summary transcript)))
+          (message "Compacting context (%d messages -> summary)..." (length compactable))
+          (condition-case err
+              (let ((summary (llm-chat--generate-compaction-summary platform prompt)))
+                (unless (= revision-start (llm-api--platform-history-revision platform))
+                  (error "History changed during compaction; aborting apply"))
+                (llm-chat--set-current-branch-compaction-summary platform summary)
+                (llm-chat--branch-set-current-prop platform :context-compaction-last-warning-revision nil)
+                (setf (llm-api--platform-history platform) (llm-chat--history-copy tail))
+                (llm-api--bump-history-revision platform)
+                (llm-chat--branch-save-current platform)
+                (llm-chat--render-history platform)
+                (llm-chat--append-banner
+                 platform
+                 (format "Context compacted successfully. Kept %d recent user turns and updated branch memory."
+                         tail-user-turns))
+                (message "Context compacted. Remaining messages: %d" (length tail)))
+            (error
+             (let ((msg (error-message-string err)))
+               (llm-chat--branch-set-current-prop platform :context-compaction-last-error msg)
+               (message "Context compaction failed: %s" msg)))))))))
+
+(defun llm-chat-show-compaction-summary ()
+  "Show current branch compaction summary in a temporary buffer."
+  (interactive)
+  (let* ((platform llm-chat--active-platform)
+         (summary (and platform
+                       (llm-chat--branch-get-current-prop platform :context-compaction-summary))))
+    (unless platform
+      (user-error "No active platform"))
+    (if (or (not (stringp summary)) (string-empty-p (string-trim summary)))
+        (message "No compaction summary stored for this branch")
+      (with-output-to-temp-buffer "*llm-compaction-summary*"
+        (princ summary)))))
+
+(defun llm-chat-clear-compaction-summary ()
+  "Clear compaction summary for the current branch."
+  (interactive)
+  (let ((platform llm-chat--active-platform))
+    (unless platform
+      (user-error "No active platform"))
+    (llm-chat--clear-current-branch-compaction-summary platform)
+    (llm-chat--branch-set-current-prop platform :context-compaction-last-warning-revision nil)
+    (llm-chat--branch-save-current platform)
+    (llm-chat--update-header-line platform)
+    (message "Cleared branch compaction summary")))
 
 (defun llm-chat-refresh-model-metadata (&optional refresh-all)
   "Refresh model metadata cache.
