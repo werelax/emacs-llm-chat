@@ -357,6 +357,50 @@ Returns the history in the format expected by llm-api."
     (llm-chat--update-header-line platform)
     (message "Model changed to %s" choice)))
 
+(defun llm-chat--model-id (model)
+  "Return canonical model id/name from MODEL string or plist."
+  (if (stringp model)
+      model
+    (or (plist-get model :model)
+        (plist-get model :id)
+        (plist-get model :name))))
+
+(defun llm-chat--model-entry-choice-name (entry)
+  "Return a user-selectable model name for model ENTRY."
+  (if (stringp entry)
+      entry
+    (or (plist-get entry :name)
+        (plist-get entry :model)
+        (plist-get entry :id))))
+
+(defun llm-chat--model-entry-matches-id-p (entry model-id)
+  "Return non-nil when model ENTRY matches MODEL-ID by id/model/name."
+  (when (and entry model-id)
+    (let ((entry-id (llm-chat--model-id entry))
+          (entry-name (if (consp entry) (plist-get entry :name) entry)))
+      (or (and (stringp entry-id) (string= entry-id model-id))
+          (and (stringp entry-name) (string= entry-name model-id))))))
+
+(defun llm-chat--refresh-platform-model-metadata (platform)
+  "Refresh model metadata for PLATFORM and keep selection valid.
+Returns plist (:count N :selected MODEL-ID :changed BOOL)."
+  (let* ((before-id (llm-api--get-selected-model platform))
+         (_ (llm-api--refresh-model-metadata platform))
+         (models (llm-api--platform-available-models platform))
+         (count (length models))
+         (still-valid (and before-id
+                           (seq-find (lambda (m)
+                                       (llm-chat--model-entry-matches-id-p m before-id))
+                                     models))))
+    (unless still-valid
+      (when-let* ((first (car models))
+                  (choice (llm-chat--model-entry-choice-name first)))
+        (llm-api--set-selected-model platform choice)))
+    (let ((after-id (llm-api--get-selected-model platform)))
+      (list :count count
+            :selected after-id
+            :changed (not (equal before-id after-id))))))
+
 (defun llm-chat--kill-process (platform)
   "Kill PLATFORM llm-api process."
   (let ((process (llm-api--platform-process platform))
@@ -387,7 +431,8 @@ Returns the history in the format expected by llm-api."
       "C-c b n" "next branch"
       "C-c b p" "previous branch"
       "C-c C-;" "commit edited history"
-      "C-c C-l" "show model limits")
+      "C-c C-l" "show model limits"
+      "C-c C-r" "refresh model metadata")
     (setq llm-chat--which-key-registered t)))
 
 (defun llm-chat--keymap (platform buffer)
@@ -423,6 +468,7 @@ Returns the history in the format expected by llm-api."
             (evil-local-set-key 'normal (kbd ";") commit-changes)
             (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
             (evil-local-set-key 'normal (kbd "C-c C-l") #'llm-chat-show-model-limits)
+            (evil-local-set-key 'normal (kbd "C-c C-r") #'llm-chat-refresh-model-metadata)
             (evil-local-set-key 'normal (kbd "C-c b c") #'llm-chat-branch-new)
             (evil-local-set-key 'normal (kbd "C-c b s") #'llm-chat-branch-switch)
             (evil-local-set-key 'normal (kbd "C-c b n") #'llm-chat-branch-next)
@@ -440,6 +486,7 @@ Returns the history in the format expected by llm-api."
           (local-set-key (kbd "r") regenerate)
           (local-set-key (kbd "C-c C-;") commit-changes)
           (local-set-key (kbd "C-c C-l") #'llm-chat-show-model-limits)
+          (local-set-key (kbd "C-c C-r") #'llm-chat-refresh-model-metadata)
           (local-set-key (kbd "C-c b c") #'llm-chat-branch-new)
           (local-set-key (kbd "C-c b s") #'llm-chat-branch-switch)
           (local-set-key (kbd "C-c b n") #'llm-chat-branch-next)
@@ -737,6 +784,39 @@ in. Default value is (current-buffer).
 (defun llm-chat-select-model ()
   (interactive)
   (llm-chat--select-model llm-chat--active-platform))
+
+(defun llm-chat-refresh-model-metadata (&optional refresh-all)
+  "Refresh model metadata cache.
+Without prefix arg, refresh only the active platform.
+With prefix arg REFRESH-ALL, refresh all enabled platforms."
+  (interactive "P")
+  (if refresh-all
+      (let ((rows '()))
+        (cl-loop for (_k platform) on llm-chat--enabled-platforms by #'cddr
+                 do (condition-case err
+                        (let* ((result (llm-chat--refresh-platform-model-metadata platform))
+                               (name (llm-api--platform-name platform)))
+                          (push (format "%s:%d" name (plist-get result :count)) rows))
+                      (error
+                       (push (format "%s:ERR" (llm-api--platform-name platform)) rows))))
+        (llm-chat--update-header-line llm-chat--active-platform)
+        (message "Refreshed model metadata -> %s" (mapconcat #'identity (nreverse rows) ", ")))
+    (let ((platform llm-chat--active-platform))
+      (unless platform
+        (user-error "No active platform"))
+      (condition-case err
+          (let* ((result (llm-chat--refresh-platform-model-metadata platform))
+                 (count (plist-get result :count))
+                 (selected (or (plist-get result :selected) "none"))
+                 (changed (if (plist-get result :changed) " (selection updated)" "")))
+            (llm-chat--update-header-line platform)
+            (message "Refreshed %s models:%d selected:%s%s"
+                     (llm-api--platform-name platform)
+                     count selected changed))
+        (error
+         (message "Failed refreshing %s metadata: %s"
+                  (llm-api--platform-name platform)
+                  (error-message-string err)))))))
 
 (defun llm-chat-show-model-limits ()
   "Show known context/output limits for current model."
