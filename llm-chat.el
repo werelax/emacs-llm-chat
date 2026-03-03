@@ -46,16 +46,6 @@
   :group 'llm-chat
   :type 'integer)
 
-(defcustom llm-chat-compaction-max-output-tokens 2000
-  "Max tokens requested for compaction summary generation."
-  :group 'llm-chat
-  :type 'integer)
-
-(defcustom llm-chat-compaction-temperature 0.2
-  "Sampling temperature used for compaction summary generation."
-  :group 'llm-chat
-  :type 'number)
-
 (defcustom llm-chat-compaction-timeout-seconds 120
   "Timeout in seconds for compaction summary generation."
   :group 'llm-chat
@@ -67,6 +57,9 @@
 
 (defvar llm-chat--branches-by-platform (make-hash-table :test 'eq)
   "Branch states keyed by platform object.")
+
+(defvar llm-chat--compaction-jobs (make-hash-table :test 'eq)
+  "Active compaction jobs keyed by platform object.")
 
 ;; Message markers and properties
 (defvar llm-chat--message-markers nil
@@ -505,9 +498,7 @@ Returns plist with keys :compactable, :tail and :split-index."
   (let* ((type (type-of platform))
          (ctor (intern (format "%s-create" (symbol-name type))))
          (ctor (if (fboundp ctor) ctor #'llm-api--platform-create))
-         (params (copy-tree (llm-api--platform-params platform)))
-         (params (plist-put params :temperature llm-chat-compaction-temperature))
-         (params (plist-put params :max_tokens llm-chat-compaction-max-output-tokens)))
+         (params (copy-tree (llm-api--platform-params platform))))
     (funcall ctor
              :name (llm-api--platform-name platform)
              :url (llm-api--platform-url platform)
@@ -523,15 +514,44 @@ Returns plist with keys :compactable, :tail and :split-index."
              :tools []
              :tool-executor nil)))
 
-(defun llm-chat--generate-compaction-summary (platform prompt)
-  "Generate compaction summary for PLATFORM using PROMPT.
-Returns summary string or signals an error." 
+(defun llm-chat--compaction-job-running-p (platform)
+  "Return non-nil when PLATFORM currently has an active compaction job." 
+  (and (gethash platform llm-chat--compaction-jobs) t))
+
+(defun llm-chat--clear-compaction-job (platform)
+  "Clear active compaction job bookkeeping for PLATFORM." 
+  (when-let* ((job (gethash platform llm-chat--compaction-jobs)))
+    (when-let* ((timer (plist-get job :timeout-timer)))
+      (cancel-timer timer))
+    (remhash platform llm-chat--compaction-jobs)))
+
+(defun llm-chat--start-compaction-job (platform prompt tail tail-user-turns revision-start branch-id-start)
+  "Start asynchronous compaction for PLATFORM using PROMPT.
+TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and BRANCH-ID-START."
   (let* ((worker (llm-chat--clone-platform-for-compaction platform))
-         (done nil)
-         (failed nil)
-         (err-msg nil)
          (summary "")
-         (deadline (+ (float-time) llm-chat-compaction-timeout-seconds)))
+         (timeout-timer nil)
+         (cleanup (lambda ()
+                    (llm-chat--clear-compaction-job platform))))
+    (setq timeout-timer
+          (run-at-time llm-chat-compaction-timeout-seconds nil
+                       (lambda ()
+                         (when (llm-chat--compaction-job-running-p platform)
+                           (llm-api--kill-process worker)
+                           (funcall cleanup)
+                           (when (and (eq platform llm-chat--active-platform)
+                                      (= branch-id-start
+                                         (or (plist-get (llm-chat--branch-current platform) :id) -1)))
+                             (llm-chat--branch-set-current-prop platform :context-compaction-last-error
+                                                                (format "Compaction timed out after %ss"
+                                                                        llm-chat-compaction-timeout-seconds)))
+                           (message "Context compaction timed out after %ss"
+                                    llm-chat-compaction-timeout-seconds)))))
+    (puthash platform (list :worker worker
+                            :timeout-timer timeout-timer
+                            :branch-id branch-id-start
+                            :revision revision-start)
+             llm-chat--compaction-jobs)
     (llm-api--add-user-message worker prompt)
     (llm-api--generate-streaming-from-history
      worker
@@ -540,22 +560,42 @@ Returns summary string or signals an error."
                   (setq summary (concat summary text))))
      :on-finish (lambda ()
                   (llm-api--add-response-to-history worker)
-                  (setq done t))
+                  (setq summary (string-trim summary))
+                  (funcall cleanup)
+                  (cond
+                   ((string-empty-p summary)
+                    (when (and (eq platform llm-chat--active-platform)
+                               (= branch-id-start
+                                  (or (plist-get (llm-chat--branch-current platform) :id) -1)))
+                      (llm-chat--branch-set-current-prop platform :context-compaction-last-error
+                                                         "Compaction returned an empty summary"))
+                    (message "Context compaction failed: empty summary"))
+                   ((/= branch-id-start
+                        (or (plist-get (llm-chat--branch-current platform) :id) -1))
+                    (message "Compaction finished, but branch changed; discarding result"))
+                   ((/= revision-start (llm-api--platform-history-revision platform))
+                    (message "Compaction finished, but history changed; discarding result"))
+                   (t
+                    (llm-chat--set-current-branch-compaction-summary platform summary)
+                    (llm-chat--branch-set-current-prop platform :context-compaction-last-warning-revision nil)
+                    (setf (llm-api--platform-history platform) (llm-chat--history-copy tail))
+                    (llm-api--bump-history-revision platform)
+                    (llm-chat--branch-save-current platform)
+                    (when (eq platform llm-chat--active-platform)
+                      (llm-chat--render-history platform)
+                      (llm-chat--append-banner
+                       platform
+                       (format "Context compacted successfully. Kept %d recent user turns and updated branch memory."
+                               tail-user-turns)))
+                    (message "Context compacted. Remaining messages: %d" (length tail))))))
      :on-error (lambda (msg _partial)
-                 (setq failed t
-                       err-msg msg
-                       done t)))
-    (while (and (not done) (< (float-time) deadline))
-      (accept-process-output (llm-api--platform-process worker) 0.1))
-    (unless done
-      (llm-api--kill-process worker)
-      (error "Compaction timed out after %ss" llm-chat-compaction-timeout-seconds))
-    (when failed
-      (error "Compaction failed: %s" err-msg))
-    (setq summary (string-trim summary))
-    (when (string-empty-p summary)
-      (error "Compaction returned an empty summary"))
-    summary))
+                 (funcall cleanup)
+                 (when (and (eq platform llm-chat--active-platform)
+                            (= branch-id-start
+                               (or (plist-get (llm-chat--branch-current platform) :id) -1)))
+                   (llm-chat--branch-set-current-prop platform :context-compaction-last-error
+                                                      (format "Compaction failed: %s" msg)))
+                 (message "Context compaction failed: %s" msg))))
 
 (defun llm-chat-commit-changes ()
   "Read current buffer state and update the chat history."
@@ -1117,6 +1157,8 @@ Keeps TAIL-USER-TURNS recent user turns verbatim (default from custom setting)."
       (user-error "No active platform"))
     (when (process-live-p process)
       (user-error "Generation is still running; wait or kill it before compacting"))
+    (when (llm-chat--compaction-job-running-p platform)
+      (user-error "Context compaction is already running for this platform"))
     ;; Include direct edits from *llm* buffer before compacting.
     (llm-chat--sync-platform-history-from-chat-buffer platform)
     (let* ((history (llm-api--platform-history platform))
@@ -1126,29 +1168,12 @@ Keeps TAIL-USER-TURNS recent user turns verbatim (default from custom setting)."
       (if (or (null compactable) (= (length compactable) 0))
           (message "Nothing to compact yet (history shorter than protected tail)")
         (let* ((revision-start (llm-api--platform-history-revision platform))
+               (branch-id-start (or (plist-get (llm-chat--branch-current platform) :id) -1))
                (previous-summary (llm-chat--branch-get-current-prop platform :context-compaction-summary))
                (transcript (llm-chat--build-compaction-transcript compactable))
                (prompt (llm-chat--build-compaction-request-prompt previous-summary transcript)))
-          (message "Compacting context (%d messages -> summary)..." (length compactable))
-          (condition-case err
-              (let ((summary (llm-chat--generate-compaction-summary platform prompt)))
-                (unless (= revision-start (llm-api--platform-history-revision platform))
-                  (error "History changed during compaction; aborting apply"))
-                (llm-chat--set-current-branch-compaction-summary platform summary)
-                (llm-chat--branch-set-current-prop platform :context-compaction-last-warning-revision nil)
-                (setf (llm-api--platform-history platform) (llm-chat--history-copy tail))
-                (llm-api--bump-history-revision platform)
-                (llm-chat--branch-save-current platform)
-                (llm-chat--render-history platform)
-                (llm-chat--append-banner
-                 platform
-                 (format "Context compacted successfully. Kept %d recent user turns and updated branch memory."
-                         tail-user-turns))
-                (message "Context compacted. Remaining messages: %d" (length tail)))
-            (error
-             (let ((msg (error-message-string err)))
-               (llm-chat--branch-set-current-prop platform :context-compaction-last-error msg)
-               (message "Context compaction failed: %s" msg)))))))))
+          (llm-chat--start-compaction-job platform prompt tail tail-user-turns revision-start branch-id-start)
+          (message "Compacting context asynchronously (%d messages)..." (length compactable)))))))
 
 (defun llm-chat-show-compaction-summary ()
   "Show current branch compaction summary in a temporary buffer."
