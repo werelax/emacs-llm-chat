@@ -141,6 +141,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
   (when (and platform (buffer-live-p llm-chat--buffer))
     (with-current-buffer llm-chat--buffer
       (setf (llm-api--platform-history platform) (llm-chat--extract-messages))
+      (llm-api--bump-history-revision platform)
       (llm-chat--branch-save-current platform))))
 
 (defun llm-chat--branch-save-current (platform)
@@ -225,6 +226,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
       (plist-put state :current-id branch-id)
       (setf (llm-api--platform-history platform)
             (llm-chat--history-copy (plist-get branch :history)))
+      (llm-api--bump-history-revision platform)
       (llm-chat--render-history platform)
       branch)))
 
@@ -277,6 +279,7 @@ Returns the history in the format expected by llm-api."
       (user-error "Cannot commit changes while generation is in progress"))
     (let ((history (llm-chat--extract-messages)))
       (setf (llm-api--platform-history platform) history)
+      (llm-api--bump-history-revision platform)
       (llm-chat--branch-save-current platform)
       (message "Chat history updated successfully"))))
 
