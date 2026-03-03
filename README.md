@@ -13,10 +13,8 @@
 
 (setq llm-api-enabled-platforms `(:open-router ,(llm--create-open-router-platform *openrouter-token*)
                                   :ollama ,(llm--create-ollama-platform)
-                                  :ollama-completion ,(llm--create-ollama-comp-platform)
                                   :pplx ,(llm--create-pplx-platform *pplx-token*)
-                                  :together-ai ,(llm--create-together-ai-platform *togetherai-token*)
-                                  :openchat-team ,(llm--create-openchat-team-platform)))
+                                  :togetherai ,(llm--create-togetherai-platform *togetherai-token*)))
 
 (setq *ollama-inference-servers*
       '((:lan-erebos . "http://erebos.local:11434")
