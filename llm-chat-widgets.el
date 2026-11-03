@@ -304,8 +304,7 @@ Returns the widget plist."
       (with-current-buffer buffer
         (let* ((inhibit-read-only t)
                (new-collapsed (not (plist-get widget :collapsed)))
-               (type (plist-get widget :type))
-               (id (plist-get widget :id)))
+               (type (plist-get widget :type)))
           (plist-put widget :collapsed new-collapsed)
           ;; Toggle body overlay visibility
           (when body-ov

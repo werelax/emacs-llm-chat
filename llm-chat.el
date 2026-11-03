@@ -1,10 +1,30 @@
-;;; ../sync/doom.d/lib/llm-chat/llm-chat.el -*- lexical-binding: t; -*-
+;;; llm-chat.el --- Chat UI for llm-api -*- lexical-binding: t; -*-
+;;
+;;; Commentary:
+;;
+;; Markdown chat buffer on top of llm-api: streaming, tool/reasoning widgets,
+;; per-platform branches, context compaction, region rewriting.
+;;
+;;; Code:
 
+(require 'cl-lib)
+(require 'seq)
+(require 'subr-x)
+(require 'spinner)
 (require 'llm-api)
 
 ;; Load widgets from same directory
-(let ((base-dir (file-name-directory (or load-file-name buffer-file-name))))
-  (load (expand-file-name "llm-chat-widgets.el" base-dir)))
+(eval-and-compile
+  (require 'llm-chat-widgets
+           (expand-file-name "llm-chat-widgets"
+                             (file-name-directory
+                              (or load-file-name
+                                  (bound-and-true-p byte-compile-current-file)
+                                  buffer-file-name)))))
+
+(defgroup llm-chat nil
+  "Chat with LLMs through llm-api."
+  :group 'tools)
 
 (defcustom llm-chat-buffer-name "*llm*" "Default llm-chat buffer."
   :group 'llm-chat
@@ -50,6 +70,17 @@
   "Timeout in seconds for compaction summary generation."
   :group 'llm-chat
   :type 'integer)
+
+(defcustom llm-chat-system-prompts-directory nil
+  "Directory with one system prompt per file, for `llm-chat-select-system-prompt'."
+  :group 'llm-chat
+  :type '(choice (const :tag "None" nil) directory))
+
+(defcustom llm-chat-change-system-prompt
+  "You rewrite text exactly as instructed. Output only the final text, without quotes, fences or commentary."
+  "System prompt used by `llm-chat-change' (region rewriting)."
+  :group 'llm-chat
+  :type 'string)
 
 (defvar llm-chat--buffer nil)
 (defvar llm-chat--enabled-platforms '())
@@ -267,9 +298,42 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
               (setq line (concat prefix model-str ctx-str branch-str))))
           (setq-local header-line-format line))))))
 
-(defun llm-chat--sync-platform-history-from-chat-buffer (platform)
-  "Sync PLATFORM history from `llm-chat--buffer' marker extraction."
-  (when (and platform (buffer-live-p llm-chat--buffer))
+(defun llm-chat--normalize-whitespace (text)
+  "Collapse all whitespace runs in TEXT to single spaces and trim."
+  (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " (or text ""))))
+
+(defun llm-chat--history-text-projection (history)
+  "Project HISTORY onto what the chat buffer shows.
+Returns a list of (ROLE . TEXT) with tool messages dropped and the assistant
+texts of one turn merged, whitespace-normalized."
+  (let (out)
+    (dolist (msg history)
+      (let ((role (alist-get :role msg))
+            (content (alist-get :content msg)))
+        (pcase role
+          (:user (push (cons :user (if (stringp content) content "")) out))
+          (:assistant
+           (when (stringp content)
+             (if (eq (caar out) :assistant)
+                 (setcdr (car out) (concat (cdar out) " " content))
+               (push (cons :assistant content) out)))))))
+    (seq-remove (lambda (entry) (and (eq (car entry) :assistant) (string-empty-p (cdr entry))))
+                (mapcar (lambda (entry)
+                          (cons (car entry) (llm-chat--normalize-whitespace (cdr entry))))
+                        (nreverse out)))))
+
+(defun llm-chat--buffer-edited-p (platform)
+  "Return non-nil when the chat buffer text differs from PLATFORM history."
+  (with-current-buffer llm-chat--buffer
+    (not (equal (llm-chat--history-text-projection (llm-chat--extract-messages))
+                (llm-chat--history-text-projection (llm-api--platform-history platform))))))
+
+(defun llm-chat--sync-platform-history-from-chat-buffer (platform &optional only-if-edited)
+  "Sync PLATFORM history from `llm-chat--buffer' marker extraction.
+The buffer only shows user/assistant text, so syncing drops tool calls and
+results.  With ONLY-IF-EDITED, sync only when the buffer was edited."
+  (when (and platform (buffer-live-p llm-chat--buffer)
+             (or (not only-if-edited) (llm-chat--buffer-edited-p platform)))
     (with-current-buffer llm-chat--buffer
       (setf (llm-api--platform-history platform) (llm-chat--extract-messages))
       (llm-api--bump-history-revision platform)
@@ -296,13 +360,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
       (setq llm-chat--buffer (get-buffer-create buf-name)))
     (with-current-buffer llm-chat--buffer
       (let ((inhibit-read-only t))
-        (unless (eq major-mode llm-chat-buffer-mode)
-          (funcall llm-chat-buffer-mode)
-          (setq-local font-lock-extra-managed-props
-                      (seq-difference font-lock-extra-managed-props
-                                      '(invisible keymap rear-nonsticky))))
-        (llm-chat--keymap platform llm-chat--buffer)
-        (llm-chat--update-header-line platform)
+        (llm-chat--prepare-buffer platform)
         (when (fboundp 'llm-chat-widget-clear-all)
           (llm-chat-widget-clear-all (current-buffer)))
         (erase-buffer)
@@ -317,10 +375,7 @@ Each element is a plist with :type (user or assistant), :start and :end markers.
                 (insert content "\n\n")
                 (llm-chat--add-message-markers start (point) 'user)))
              ((and (eq role :assistant) (stringp content))
-              (insert (format "## %s (%s):\n\n"
-                              llm-chat-assistant-nick
-                              (llm-api--get-model-name platform
-                                                       (llm-api--platform-selected-model platform))))
+              (insert (llm-chat--assistant-header platform))
               (let ((start (point)))
                 (insert content "\n\n")
                 (llm-chat--add-message-markers start (point) 'assistant))))))
@@ -495,24 +550,12 @@ Returns plist with keys :compactable, :tail and :split-index."
 
 (defun llm-chat--clone-platform-for-compaction (platform)
   "Create a temporary PLATFORM clone for compaction summarization requests."
-  (let* ((type (type-of platform))
-         (ctor (intern (format "%s-create" (symbol-name type))))
-         (ctor (if (fboundp ctor) ctor #'llm-api--platform-create))
-         (params (copy-tree (llm-api--platform-params platform))))
-    (funcall ctor
-             :name (llm-api--platform-name platform)
-             :url (llm-api--platform-url platform)
-             :token (llm-api--platform-token platform)
-             :system-prompt "You summarize previous conversation context for continuity."
-             :system-prompt-role (llm-api--platform-system-prompt-role platform)
-             :context-compaction-summary nil
-             :history nil
-             :available-models (copy-tree (llm-api--platform-available-models platform))
-             :selected-model (copy-tree (llm-api--platform-selected-model platform))
-             :params params
-             :process-buffer-name (format "*llm-compaction-%s*" (llm-api--platform-name platform))
-             :tools []
-             :tool-executor nil)))
+  (llm-api--clone-platform
+   platform
+   :system-prompt "You summarize previous conversation context for continuity."
+   :process-buffer-name (format "*llm-compaction-%s*" (llm-api--platform-name platform))
+   :tools []
+   :tool-executor nil))
 
 (defun llm-chat--compaction-job-running-p (platform)
   "Return non-nil when PLATFORM currently has an active compaction job." 
@@ -527,7 +570,8 @@ Returns plist with keys :compactable, :tail and :split-index."
 
 (defun llm-chat--start-compaction-job (platform prompt tail tail-user-turns revision-start branch-id-start)
   "Start asynchronous compaction for PLATFORM using PROMPT.
-TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and BRANCH-ID-START."
+TAIL and TAIL-USER-TURNS are applied on success, guarded by
+REVISION-START and BRANCH-ID-START."
   (let* ((worker (llm-chat--clone-platform-for-compaction platform))
          (summary "")
          (timeout-timer nil)
@@ -600,9 +644,8 @@ TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and B
 (defun llm-chat-commit-changes ()
   "Read current buffer state and update the chat history."
   (interactive)
-  (let* ((platform llm-chat--active-platform)
-         (process (llm-api--platform-process platform)))
-    (when (process-live-p process)
+  (let ((platform llm-chat--active-platform))
+    (when (llm-api--busy-p platform)
       (user-error "Cannot commit changes while generation is in progress"))
     (let ((history (llm-chat--extract-messages)))
       (setf (llm-api--platform-history platform) history)
@@ -613,8 +656,8 @@ TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and B
 (defun llm-chat--msg (platform prompt)
   "Send PROMPT to llm PLATFORM."
   (let ((display-buffer-alist
-         '(("\\*llm\\*"
-            (llm-chat--display-buffer-reuse-llm-api-or-ellama-or-scratch)
+         `((,(regexp-quote llm-chat-buffer-name)
+            (llm-chat--display-buffer)
             (reusable-frames . visible)))))
     (llm-chat--send platform prompt)))
 
@@ -623,31 +666,61 @@ TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and B
   (let ((text (if (region-active-p)
                   (buffer-substring-no-properties (region-beginning) (region-end))
                 (buffer-substring-no-properties (point-min) (point-max)))))
-    ;; (llm-chat--msg platform (format "Text:\n%s\nRegarding this text, %s" text prompt))
-    (llm-chat--msg platform (format "Regarding this text, %s:\n\n```text\n%s\n```" prompt text))
-    ))
+    (llm-chat--msg platform (format "Regarding this text, %s:\n\n```text\n%s\n```" prompt text))))
+
+(defvar-local llm-chat--change-worker nil
+  "Platform clone running a `llm-chat-change' rewrite in this buffer.")
 
 (defun llm-chat--change (platform change-prompt)
-  "Change selected text with PLATFORM according to provided CHANGE-PROMPT."
-  (let* ((beg (if (region-active-p)
-                  (region-beginning)
-                (point-min)))
-         (end (if (region-active-p)
-                  (region-end)
-                (point-max)))
-         (text (buffer-substring-no-properties beg end)))
+  "Rewrite the region (or buffer) with PLATFORM according to CHANGE-PROMPT.
+Uses a throwaway clone of PLATFORM: the chat history is not touched, tools
+are disabled and reasoning is not inserted.  The original text is put in
+the kill ring, and restored if the request fails."
+  (when (and llm-chat--change-worker (llm-api--busy-p llm-chat--change-worker))
+    (user-error "A rewrite is already running in this buffer"))
+  (let* ((buffer (current-buffer))
+         (beg (if (region-active-p) (region-beginning) (point-min)))
+         (end (if (region-active-p) (region-end) (point-max)))
+         (text (buffer-substring-no-properties beg end))
+         (worker (llm-api--clone-platform platform
+                                          :system-prompt llm-chat-change-system-prompt
+                                          :tools []
+                                          :tool-executor nil))
+         (start-marker (copy-marker beg))
+         (end-marker (copy-marker beg t))
+         (at-start t))
     (kill-region beg end)
-    (llm-chat--stream platform
-                      (format "Change the following text, %s, just output the final text without additional quotes around it:\n%s"
-                              change-prompt text)
-                      :on-finish (lambda (_buffer &rest args)
-                                   (let ((end (plist-get args :end)))
-                                     (when (string-match "\n\\'" text)
-                                       ;; insert one \n if the regiond ended with one
-                                       (save-excursion
-                                         (goto-char end)
-                                         (insert "\n")))))
-                      :point beg)))
+    (setq llm-chat--change-worker worker)
+    (spinner-start llm-chat-spinner-type)
+    (llm-api--add-user-message
+     worker (format "Change the following text, %s:\n\n%s" change-prompt text))
+    (llm-api--generate-streaming-from-history
+     worker
+     :on-data (lambda (chunk)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (save-excursion
+                      (goto-char end-marker)
+                      (insert (if at-start (string-trim-left chunk) chunk))
+                      (setq at-start (and at-start (string-blank-p chunk)))))))
+     :on-finish (lambda ()
+                  (when (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      ;; Keep the trailing newline the original text had.
+                      (when (string-suffix-p "\n" text)
+                        (save-excursion
+                          (goto-char end-marker)
+                          (unless (eq (char-before) ?\n) (insert "\n"))))
+                      (spinner-stop)
+                      (setq llm-chat--change-worker nil))))
+     :on-error (lambda (err-msg _partial)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (delete-region start-marker end-marker)
+                     (save-excursion (goto-char start-marker) (insert text))
+                     (spinner-stop)
+                     (setq llm-chat--change-worker nil)))
+                 (message "llm-chat change failed (text restored): %s" err-msg)))))
 
 (defun llm-chat--clear-history (platform)
   "Clear chat history for PLATFORM."
@@ -683,7 +756,13 @@ TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and B
         (setq llm-chat--message-markers (delq marker-pair llm-chat--message-markers))))))
 
 (defun llm-chat--regenerate (platform)
-  (llm-api--remove-last-from-history platform)
+  "Regenerate the answer to the last user message on PLATFORM.
+Drops the last assistant turn (including its tool calls); after a failed
+request, simply retries the last user message."
+  (when (llm-api--busy-p platform)
+    (user-error "Generation is still running; wait or kill it first"))
+  (unless (llm-api--truncate-history-after-last-user platform)
+    (user-error "Nothing to regenerate"))
   (llm-chat--remove-last-assistant-from-buffer)
   (llm-chat--insert-platform-header platform)
   (with-current-buffer llm-chat--buffer
@@ -702,175 +781,127 @@ TAIL and TAIL-USER-TURNS are applied on success, guarded by REVISION-START and B
     (llm-chat--update-header-line platform)
     (message "Model changed to %s" choice)))
 
-(defun llm-chat--model-id (model)
-  "Return canonical model id/name from MODEL string or plist."
-  (if (stringp model)
-      model
-    (or (plist-get model :model)
-        (plist-get model :id)
-        (plist-get model :name))))
-
-(defun llm-chat--model-entry-choice-name (entry)
-  "Return a user-selectable model name for model ENTRY."
-  (if (stringp entry)
-      entry
-    (or (plist-get entry :name)
-        (plist-get entry :model)
-        (plist-get entry :id))))
-
-(defun llm-chat--model-entry-matches-id-p (entry model-id)
-  "Return non-nil when model ENTRY matches MODEL-ID by id/model/name."
-  (when (and entry model-id)
-    (let ((entry-id (llm-chat--model-id entry))
-          (entry-name (if (consp entry) (plist-get entry :name) entry)))
-      (or (and (stringp entry-id) (string= entry-id model-id))
-          (and (stringp entry-name) (string= entry-name model-id))))))
-
 (defun llm-chat--refresh-platform-model-metadata (platform)
-  "Refresh model metadata for PLATFORM and keep selection valid.
+  "Refresh model metadata for PLATFORM (the selection is kept valid).
 Returns plist (:count N :selected MODEL-ID :changed BOOL)."
-  (let* ((before-id (llm-api--get-selected-model platform))
-         (_ (llm-api--refresh-model-metadata platform))
-         (models (llm-api--platform-available-models platform))
-         (count (length models))
-         (still-valid (and before-id
-                           (seq-find (lambda (m)
-                                       (llm-chat--model-entry-matches-id-p m before-id))
-                                     models))))
-    (unless still-valid
-      (when-let* ((first (car models))
-                  (choice (llm-chat--model-entry-choice-name first)))
-        (llm-api--set-selected-model platform choice)))
-    (let ((after-id (llm-api--get-selected-model platform)))
-      (list :count count
-            :selected after-id
-            :changed (not (equal before-id after-id))))))
+  (let ((before (llm-api--platform-selected-model platform)))
+    (llm-api--refresh-model-metadata platform)
+    (let ((after (llm-api--platform-selected-model platform)))
+      (list :count (length (llm-api--platform-available-models platform))
+            :selected after
+            :changed (not (equal before after))))))
 
 (defun llm-chat--kill-process (platform)
-  "Kill PLATFORM llm-api process."
-  (let ((process (llm-api--platform-process platform))
-        (buffer llm-chat--buffer))
-    (when (process-live-p process)
-      (delete-process process)
-      (setf (llm-api--platform-process platform) nil)
-      (when (buffer-live-p (get-buffer buffer))
-        (with-current-buffer buffer
+  "Cancel PLATFORM's generation, including pending tool executions.
+Also cancels a `llm-chat-change' rewrite running in the current buffer."
+  (let ((killed nil))
+    (when (and llm-chat--change-worker (llm-api--busy-p llm-chat--change-worker))
+      (llm-api--kill-process llm-chat--change-worker)
+      (setq llm-chat--change-worker nil)
+      (spinner-stop)
+      (setq killed t))
+    (when (and platform (llm-api--busy-p platform))
+      (llm-api--kill-process platform)
+      (when (buffer-live-p llm-chat--buffer)
+        (with-current-buffer llm-chat--buffer
           (spinner-stop)))
-      (message "Process killed"))))
+      (setq killed t))
+    (message (if killed "Process killed" "Nothing to kill"))))
 
 ;; keys
 
-(defvar llm-chat--which-key-registered nil
-  "Whether llm-chat which-key replacements are already registered.")
+(defvar llm-chat-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'llm-chat-msg)
+    (define-key map (kbd "C-c C-;") #'llm-chat-commit-changes)
+    (define-key map (kbd "C-c C-e") #'llm-chat-regenerate-from-edited-history)
+    (define-key map (kbd "C-c C-l") #'llm-chat-show-model-limits)
+    (define-key map (kbd "C-c C-u") #'llm-chat-refresh-model-metadata)
+    (define-key map (kbd "C-c C-m") #'llm-chat-compact-context)
+    (define-key map (kbd "C-c C-v") #'llm-chat-show-compaction-summary)
+    (define-key map (kbd "C-c C-k") #'llm-chat-clear-compaction-summary)
+    (define-key map (kbd "C-c b c") #'llm-chat-branch-new)
+    (define-key map (kbd "C-c b e") #'llm-chat-branch-new-from-edited-history)
+    (define-key map (kbd "C-c b s") #'llm-chat-branch-switch)
+    (define-key map (kbd "C-c b n") #'llm-chat-branch-next)
+    (define-key map (kbd "C-c b p") #'llm-chat-branch-prev)
+    ;; Explicit widget toggles for terminal key handling consistency
+    (define-key map (kbd "TAB") #'llm-chat-widget-toggle-at-point)
+    (define-key map (kbd "<tab>") #'llm-chat-widget-toggle-at-point)
+    map)
+  "Keymap for `llm-chat-mode'.")
 
-(setq llm-chat--which-key-registered nil)
+(with-eval-after-load 'evil
+  (when (fboundp 'evil-define-key*)
+    (evil-define-key* 'normal llm-chat-mode-map
+      (kbd "RET") #'llm-chat-msg
+      ;; Keep vertical movement aligned with visible lines; avoids landing on
+      ;; hidden collapsed widget body newlines.
+      (kbd "j") #'next-line
+      (kbd "k") #'previous-line
+      (kbd "TAB") #'llm-chat-widget-toggle-at-point
+      (kbd "<tab>") #'llm-chat-widget-toggle-at-point
+      (kbd "C-i") #'llm-chat-widget-toggle-at-point
+      (kbd "q") #'llm-chat-quit
+      (kbd "r") #'llm-chat-regenerate
+      (kbd ";") #'llm-chat-commit-changes
+      (kbd "<backspace>") #'llm-chat-clear-history)))
 
-(defun llm-chat--register-which-key-bindings ()
-  "Register human-friendly which-key labels for llm-chat bindings."
-  (when (and (not llm-chat--which-key-registered)
-             (fboundp 'which-key-add-key-based-replacements))
-    (which-key-add-key-based-replacements
+(with-eval-after-load 'which-key
+  (when (fboundp 'which-key-add-keymap-based-replacements)
+    (which-key-add-keymap-based-replacements llm-chat-mode-map
       "C-c b" "llm branches"
       "C-c b c" "create branch"
+      "C-c b e" "branch from edited history"
       "C-c b s" "switch branch"
       "C-c b n" "next branch"
       "C-c b p" "previous branch"
       "C-c C-;" "commit edited history"
+      "C-c C-e" "regenerate from edited history"
       "C-c C-l" "show model limits"
-      "C-c C-r" "refresh model metadata"
+      "C-c C-u" "refresh model metadata"
       "C-c C-m" "compact context"
       "C-c C-v" "show compact summary"
-      "C-c C-k" "clear compact summary")
-    (setq llm-chat--which-key-registered t)))
+      "C-c C-k" "clear compact summary")))
 
-(defun llm-chat--keymap (platform buffer)
-  "Keyjap for llm-api chat with PLATFORM in BUFFER."
-  (llm-chat--register-which-key-bindings)
-  (with-current-buffer buffer
-    (let ((quit-llm (lambda ()
-                      (interactive)
-                      (quit-window t)
-                      (llm-chat--kill-process platform)
-                      (llm-chat--clear-history platform)
-                      (kill-buffer buffer)))
-          (send-llm (lambda (p)
-                      (interactive "s> ")
-                      (llm-chat--msg platform p)))
-          (clear-history (lambda () (llm-chat--clear-history platform)))
-          (regenerate (lambda ()
-                        (interactive)
-                        (llm-chat--regenerate platform)))
-          (commit-changes (lambda ()
-                            (interactive)
-                            (llm-chat-commit-changes))))
-      (if (featurep 'evil)
-          ;; evil
-          (progn
-            (evil-local-set-key 'normal (kbd "RET") send-llm)
-            ;; Keep vertical movement aligned with visible lines in chat buffer.
-            ;; This avoids landing on hidden collapsed widget body newlines.
-            (evil-local-set-key 'normal (kbd "j") #'next-line)
-            (evil-local-set-key 'normal (kbd "k") #'previous-line)
-            ;; Explicit widget toggles for terminal/evil key handling consistency
-            (evil-local-set-key 'normal (kbd "TAB") #'llm-chat-widget-toggle-at-point)
-            (evil-local-set-key 'normal (kbd "<tab>") #'llm-chat-widget-toggle-at-point)
-            (evil-local-set-key 'normal (kbd "C-i") #'llm-chat-widget-toggle-at-point)
-            (evil-local-set-key 'normal (kbd "q") quit-llm)
-            (evil-local-set-key 'normal (kbd "r") regenerate)
-            (evil-local-set-key 'normal (kbd ";") commit-changes)
-            (evil-local-set-key 'normal (kbd "C-c C-;") commit-changes)
-            (evil-local-set-key 'normal (kbd "C-c C-l") #'llm-chat-show-model-limits)
-            (evil-local-set-key 'normal (kbd "C-c C-r") #'llm-chat-refresh-model-metadata)
-            (evil-local-set-key 'normal (kbd "C-c C-m") #'llm-chat-compact-context)
-            (evil-local-set-key 'normal (kbd "C-c C-v") #'llm-chat-show-compaction-summary)
-            (evil-local-set-key 'normal (kbd "C-c C-k") #'llm-chat-clear-compaction-summary)
-            (evil-local-set-key 'normal (kbd "C-c b c") #'llm-chat-branch-new)
-            (evil-local-set-key 'normal (kbd "C-c b s") #'llm-chat-branch-switch)
-            (evil-local-set-key 'normal (kbd "C-c b n") #'llm-chat-branch-next)
-            (evil-local-set-key 'normal (kbd "C-c b p") #'llm-chat-branch-prev)
-            (evil-local-set-key 'normal (kbd "<backspace>") clear-history))
-        ;; not evil
-        (let ((chat-keymap (copy-keymap (current-local-map))))
-          (use-local-map chat-keymap)
-          (local-set-key (kbd "RET") send-llm)
-          ;; Explicit widget toggles for terminal key handling consistency
-          (local-set-key (kbd "TAB") #'llm-chat-widget-toggle-at-point)
-          (local-set-key (kbd "<tab>") #'llm-chat-widget-toggle-at-point)
-          (local-set-key (kbd "C-i") #'llm-chat-widget-toggle-at-point)
-          (local-set-key (kbd "q") quit-llm)
-          (local-set-key (kbd "r") regenerate)
-          (local-set-key (kbd "C-c C-;") commit-changes)
-          (local-set-key (kbd "C-c C-l") #'llm-chat-show-model-limits)
-          (local-set-key (kbd "C-c C-r") #'llm-chat-refresh-model-metadata)
-          (local-set-key (kbd "C-c C-m") #'llm-chat-compact-context)
-          (local-set-key (kbd "C-c C-v") #'llm-chat-show-compaction-summary)
-          (local-set-key (kbd "C-c C-k") #'llm-chat-clear-compaction-summary)
-          (local-set-key (kbd "C-c b c") #'llm-chat-branch-new)
-          (local-set-key (kbd "C-c b s") #'llm-chat-branch-switch)
-          (local-set-key (kbd "C-c b n") #'llm-chat-branch-next)
-          (local-set-key (kbd "C-c b p") #'llm-chat-branch-prev)
-          (local-set-key (kbd "<backspace>") clear-history))))))
+(define-minor-mode llm-chat-mode
+  "Minor mode for the llm-chat buffer.
+
+\\{llm-chat-mode-map}"
+  :lighter " LLM"
+  :keymap llm-chat-mode-map
+  (when (fboundp 'evil-normalize-keymaps)
+    (evil-normalize-keymaps)))
+
+(defun llm-chat--prepare-buffer (platform)
+  "Set up the current buffer as the chat buffer for PLATFORM."
+  (unless (eq major-mode llm-chat-buffer-mode)
+    (funcall llm-chat-buffer-mode)
+    ;; Prevent font-lock from stripping widget text properties
+    (setq-local font-lock-extra-managed-props
+                (seq-difference font-lock-extra-managed-props
+                                '(invisible keymap rear-nonsticky))))
+  (unless llm-chat-mode
+    (llm-chat-mode 1))
+  (llm-chat--update-header-line platform))
+
+(defun llm-chat--assistant-header (platform)
+  "Return the markdown header for an assistant message of PLATFORM."
+  (format "## %s (%s):\n\n"
+          llm-chat-assistant-nick
+          (or (llm-api--get-model-name platform (llm-api--platform-selected-model platform))
+              "-")))
 
 ;; private functions
 
-(defun llm-chat--display-buffer-reuse-llm-api-or-ellama-or-scratch (buffer alist)
-  "Display BUFFER ALIST.
-Preferring a window showing '*llm*', '*poe*', '*ellama*' or '*scratch*'. Scrolls
-to the end to make the answer visible."
-  (let ((window (or
-                 ;; Try to reuse a window that's already showing *poe*.
-                 (display-buffer-reuse-window buffer alist)
-                 ;; If no window is showing *ellama*/*poe*, try to reuse one showing *scratch* or *ellama*.
-                 (let ((scratch-window (or (get-buffer-window "*ellama*" 'visible)
-                                           (get-buffer-window "*poe*" 'visible)
-                                           (get-buffer-window "*scratch*" 'visible))))
-                   (when scratch-window
-                     ;; If we found a window, display the buffer there.
-                     (window--display-buffer buffer scratch-window 'reuse alist)))
-                 ;; If no suitable window is found, fallback to default behavior.
-                 (let ((display-buffer-alist nil))
-                   (display-buffer-pop-up-window buffer alist)))))
-    ;; Scroll to make the last line of the buffer the first line in the window.
+(defun llm-chat--display-buffer (buffer alist)
+  "Display BUFFER (with ALIST) reusing a window showing it or *scratch*.
+Scrolls to the end to make the answer visible."
+  (let ((window (or (display-buffer-reuse-window buffer alist)
+                    (when-let* ((scratch-window (get-buffer-window "*scratch*" 'visible)))
+                      (window--display-buffer buffer scratch-window 'reuse alist))
+                    (let ((display-buffer-alist nil))
+                      (display-buffer-pop-up-window buffer alist)))))
     (when window
       (with-selected-window window
         (goto-char (point-max))
@@ -879,8 +910,12 @@ to the end to make the answer visible."
 
 (defun llm-chat--send (platform prompt)
   "Send PROMPT to PLATFORM."
-  (when (process-live-p (llm-api--platform-process platform))
+  (unless platform
+    (user-error "No active platform"))
+  (when (llm-api--busy-p platform)
     (user-error "Generation is still running; wait or kill it before sending a new prompt"))
+  ;; Warm the model metadata cache in the background (context window etc.).
+  (llm-api--prefetch-models platform (lambda () (llm-chat--update-header-line platform)))
   (let ((buf-name (or llm-chat-buffer-name "*llm*"))
         (buffer llm-chat--buffer))
     (when (not (buffer-live-p buffer))
@@ -890,15 +925,7 @@ to the end to make the answer visible."
       (let ((window (display-buffer llm-chat--buffer)))
         (when (window-live-p window)
           (select-window window)))
-      ;; (goto-char (point-max))
-      (unless (eq major-mode llm-chat-buffer-mode)
-        (funcall llm-chat-buffer-mode)
-        ;; Prevent font-lock from stripping widget text properties
-        (setq-local font-lock-extra-managed-props
-                    (seq-difference font-lock-extra-managed-props
-                                   '(invisible keymap rear-nonsticky))))
-      (llm-chat--keymap platform llm-chat--buffer)
-      (llm-chat--update-header-line platform)
+      (llm-chat--prepare-buffer platform)
       (when (not (string-empty-p prompt))
 
         ;; Insert user message header
@@ -911,11 +938,8 @@ to the end to make the answer visible."
           (llm-chat--add-message-markers start (point) 'user))
 
         ;; Insert assistant header
-        (insert (format "## %s (%s):\n\n"
-                        llm-chat-assistant-nick
-                        (llm-api--get-model-name platform
-                                                 (llm-api--platform-selected-model platform))))
-        
+        (insert (llm-chat--assistant-header platform))
+
         ;; Add markers for assistant message (content will be streamed)
         (goto-char (point-max))
         (let ((assist-start (point)))
@@ -926,17 +950,13 @@ to the end to make the answer visible."
             (set-window-point window (point-max))
             (with-selected-window window (recenter 3)))))
 
-      (let* ((on-insert (lambda (buffer &rest args)
+      (let* ((on-insert (lambda (buffer &rest _args)
                           ;; Update the end marker of the last assistant message
-                          (when-let* ((last-marker (car llm-chat--message-markers)))
-                            (when (eq (plist-get last-marker :type) 'assistant)
-                              (set-marker (plist-get last-marker :end) (point-max))))
-                          ;; NOTE: this code was commented to disable automatic scroll when generating
-                          ;; (when-let (window (get-buffer-window buffer 'visible))
-                          ;;   (with-selected-window window
-                          ;;     (goto-char (point-max))))
-                          ))
-             (on-finish (lambda (buffer &rest args)
+                          (with-current-buffer buffer
+                            (when-let* ((last-marker (car llm-chat--message-markers)))
+                              (when (eq (plist-get last-marker :type) 'assistant)
+                                (set-marker (plist-get last-marker :end) (point-max)))))))
+             (on-finish (lambda (buffer &rest _args)
                           (with-current-buffer buffer
                             (save-excursion
                               (goto-char (point-max))
@@ -956,19 +976,19 @@ to the end to make the answer visible."
     (when (not (buffer-live-p buffer))
       (setq llm-chat--buffer (get-buffer-create buf-name)))
     (with-current-buffer llm-chat--buffer
-      (insert (format "## %s (%s):\n\n"
-                      llm-chat-assistant-nick
-                      (llm-api--get-model-name platform
-                                               (llm-api--platform-selected-model platform)))))))
+      (goto-char (point-max))
+      (insert (llm-chat--assistant-header platform)))))
 
 (defun llm-chat--stream (platform prompt &rest args)
   "Query PLATFORM for PROMPT.
 ARGS contains keys for fine control.
 
-:buffer BUFFER -- BUFFER is the buffer (or `buffer-name') to insert ellama reply
+:buffer BUFFER -- BUFFER is the buffer (or `buffer-name') to insert the reply
 in. Default value is (current-buffer).
 
-:point POINT -- POINT is the point in buffer to insert ellama reaply at."
+:point POINT -- POINT is the point in buffer to insert the reply at.
+
+:on-insert FN, :on-finish FN -- called as (FN BUFFER &rest PLIST)."
   (let* ((buffer (or (plist-get args :buffer) (current-buffer)))
          (point (or (plist-get args :point)
                     (with-current-buffer buffer (point))))
@@ -1025,7 +1045,7 @@ in. Default value is (current-buffer).
                                                  name args-str)))
                                     (puthash idx widget tool-widgets)
                                     (setcar widget-gap-pending t)))))
-               (on-tool-done (lambda (idx name result-str)
+               (on-tool-done (lambda (idx _name result-str)
                                (when (buffer-live-p buffer)
                                  (let ((widget (gethash idx tool-widgets)))
                                    (when widget
@@ -1100,6 +1120,9 @@ in. Default value is (current-buffer).
 ;; user interface
 
 (defun llm-chat-set-platforms (platforms)
+  "Use PLATFORMS, a plist (:key PLATFORM ...), as the selectable platforms.
+Keeps the active platform when still present, else picks
+`llm-chat-default-platform-key' or the first one."
   (setq llm-chat--enabled-platforms platforms)
   (let* ((current llm-chat--active-platform)
          (current-valid (cl-loop for (_k v) on platforms by #'cddr
@@ -1116,55 +1139,96 @@ in. Default value is (current-buffer).
       (llm-chat--update-header-line llm-chat--active-platform))))
 
 (defun llm-chat-select-platform ()
+  "Switch the active platform and show its conversation."
   (interactive)
-  (let ((platforms (cl-loop for (key nil) on llm-chat--enabled-platforms by #'cddr
-                            collect key)))
-    (let ((choice (completing-read "> " platforms)))
-      (setq llm-chat--active-platform (plist-get llm-chat--enabled-platforms (intern choice)))
-      (llm-chat--branch-state llm-chat--active-platform)
-      (llm-chat--sync-platform-compaction-summary-from-branch llm-chat--active-platform)
-      (llm-chat--render-history llm-chat--active-platform))))
+  (let* ((keys (cl-loop for (key nil) on llm-chat--enabled-platforms by #'cddr
+                        collect (symbol-name key)))
+         (choice (completing-read "Platform: " keys nil t))
+         (platform (plist-get llm-chat--enabled-platforms (intern choice))))
+    (setq llm-chat--active-platform platform)
+    (llm-chat--branch-state platform)
+    (llm-chat--sync-platform-compaction-summary-from-branch platform)
+    (llm-chat--render-history platform)
+    (llm-api--prefetch-models platform (lambda () (llm-chat--update-header-line platform)))))
 
 (defun llm-chat-msg (prompt)
+  "Send PROMPT to the active platform."
+  (interactive "s> ")
   (llm-chat--msg llm-chat--active-platform prompt))
 
+(defun llm-chat-new-chat (prompt)
+  "Clear the history and start a new conversation with PROMPT."
+  (interactive "s> ")
+  (llm-chat-clear-history)
+  (llm-chat-msg prompt))
+
+(defun llm-chat-new-chat-with-buffer ()
+  "Start a new conversation whose first message is the current buffer."
+  (interactive)
+  (llm-chat-new-chat (buffer-substring-no-properties (point-min) (point-max))))
+
 (defun llm-chat-regenerate ()
+  "Regenerate the last answer."
   (interactive)
   (llm-chat--regenerate llm-chat--active-platform))
 
 (defun llm-chat-about (prompt)
+  "Ask the active platform PROMPT about the region (or the whole buffer)."
+  (interactive "sAbout this text: ")
   (llm-chat--about llm-chat--active-platform prompt))
 
+(defalias 'llm-chat-interactive-chat-about #'llm-chat-about)
+
 (defun llm-chat-change (change-prompt)
+  "Rewrite the region (or the whole buffer) following CHANGE-PROMPT."
+  (interactive "sChange: ")
   (llm-chat--change llm-chat--active-platform change-prompt))
 
 (defun llm-chat-clear-history ()
+  "Clear the conversation of the active platform."
   (interactive)
   (llm-chat--clear-history llm-chat--active-platform))
 
 (defun llm-chat-kill-process ()
+  "Stop the running generation (and rewrite in the current buffer)."
   (interactive)
   (llm-chat--kill-process llm-chat--active-platform))
 
 (defun llm-chat-select-model ()
+  "Select the model of the active platform (any model id can be typed)."
   (interactive)
   (llm-chat--select-model llm-chat--active-platform))
+
+(defun llm-chat-quit ()
+  "Stop generation, clear the conversation and close the chat buffer."
+  (interactive)
+  (let ((platform llm-chat--active-platform)
+        (buffer llm-chat--buffer))
+    (when (buffer-live-p buffer)
+      (dolist (window (get-buffer-window-list buffer nil t))
+        (quit-window nil window)))
+    (when platform
+      (when (llm-api--busy-p platform)
+        (llm-api--kill-process platform))
+      (llm-chat--clear-history platform))
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer))))
 
 (defun llm-chat-compact-context (&optional tail-user-turns)
   "Manually compact old history into branch-scoped summary memory.
 Keeps TAIL-USER-TURNS recent user turns verbatim (default from custom setting)."
   (interactive)
   (let* ((platform llm-chat--active-platform)
-         (tail-user-turns (or tail-user-turns llm-chat-compaction-tail-turns))
-         (process (and platform (llm-api--platform-process platform))))
+         (tail-user-turns (or tail-user-turns llm-chat-compaction-tail-turns)))
     (unless platform
       (user-error "No active platform"))
-    (when (process-live-p process)
+    (when (llm-api--busy-p platform)
       (user-error "Generation is still running; wait or kill it before compacting"))
     (when (llm-chat--compaction-job-running-p platform)
       (user-error "Context compaction is already running for this platform"))
-    ;; Include direct edits from *llm* buffer before compacting.
-    (llm-chat--sync-platform-history-from-chat-buffer platform)
+    ;; Include direct edits from the chat buffer before compacting (only when
+    ;; there are any: syncing drops tool calls/results from the history).
+    (llm-chat--sync-platform-history-from-chat-buffer platform t)
     (let* ((history (llm-api--platform-history platform))
            (split (llm-chat--split-history-for-compaction history tail-user-turns))
            (compactable (plist-get split :compactable))
@@ -1212,7 +1276,7 @@ With prefix arg REFRESH-ALL, refresh all enabled platforms."
   (if refresh-all
       (let ((rows '()))
         (cl-loop for (_k platform) on llm-chat--enabled-platforms by #'cddr
-                 do (condition-case err
+                 do (condition-case nil
                         (let* ((result (llm-chat--refresh-platform-model-metadata platform))
                                (name (llm-api--platform-name platform)))
                           (push (format "%s:%d" name (plist-get result :count)) rows))
@@ -1348,28 +1412,45 @@ When NAME is empty, an automatic branch name is used."
   (llm-chat--sync-platform-history-from-chat-buffer llm-chat--active-platform)
   (llm-chat-branch-new name))
 
-(defun llm-chat-interactive-chat-about ()
-  (interactive)
-  (let ((prompt (read-string "> ")))
-    (llm-chat--about llm-chat--active-platform prompt)))
-
-(defun llm-chat-set-system-prompt ()
-  (interactive)
-  (let ((prompt (read-string "system> ")))
-    (setf (llm-api--platform-system-prompt llm-chat--active-platform) prompt)))
+(defun llm-chat-set-system-prompt (prompt)
+  "Set the system PROMPT of the active platform."
+  (interactive (list (read-string "system> " (llm-chat-get-system-prompt))))
+  (setf (llm-api--platform-system-prompt llm-chat--active-platform) prompt))
 
 (defun llm-chat-get-system-prompt ()
-  (message "SYSTEM: %s" (llm-api--platform-system-prompt llm-chat--active-platform)))
+  "Return the system prompt of the active platform."
+  (llm-api--platform-system-prompt llm-chat--active-platform))
 
 (defun llm-chat-show-system-prompt ()
+  "Show the system prompt of the active platform."
   (interactive)
-  (message "SYSTEM: %s" (llm-api--platform-system-prompt llm-chat--active-platform)))
+  (message "SYSTEM: %s" (llm-chat-get-system-prompt)))
 
-(defun llm-chat-set-temperature ()
+(defun llm-chat-select-system-prompt ()
+  "Set the active platform's system prompt from a file.
+Files are read from `llm-chat-system-prompts-directory'."
   (interactive)
-  (let ((prompt (read-string "temp> ")))
-    (setf (llm-api--platform-params llm-chat--active-platform)
-          (plist-put (llm-api--platform-params llm-chat--active-platform) :temperature (string-to-number prompt)))))
+  (let ((dir llm-chat-system-prompts-directory))
+    (unless (and dir (file-directory-p dir))
+      (user-error "Set `llm-chat-system-prompts-directory' to a directory of prompts"))
+    (let* ((choice (completing-read "System prompt: "
+                                    (directory-files dir nil "\\`[^.]") nil t))
+           (prompt (with-temp-buffer
+                     (insert-file-contents (expand-file-name choice dir))
+                     (buffer-string))))
+      (llm-chat-set-system-prompt prompt)
+      (message "System prompt: %s" choice))))
+
+(defun llm-chat-set-temperature (temperature)
+  "Set the sampling TEMPERATURE of the active platform."
+  (interactive (list (read-number "Temperature: "
+                                  (or (plist-get (llm-api--platform-params llm-chat--active-platform)
+                                                 :temperature)
+                                      0.7))))
+  (let ((platform llm-chat--active-platform))
+    (setf (llm-api--platform-params platform)
+          (plist-put (copy-sequence (llm-api--platform-params platform))
+                     :temperature temperature))))
 
 (provide 'llm-chat)
 ;;; llm-chat.el ends here
